@@ -1,0 +1,49 @@
+name: Bug report
+description: Report a reproducible problem in Supprocom.ScaleToolChain.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for a reproducible problem.
+        Do not include secrets or personal data.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Problem summary
+      description: Describe the problem and the result that you expected.
+      placeholder: State what happened and what you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: List the smallest steps that show the problem.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Provide the operating system, runtime, and commit or version.
+      placeholder: |
+        - Operating system:
+        - Runtime:
+        - Version or commit:
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and extra context
+      description: Add relevant logs or other context. Remove secrets before you submit.
+      render: text
+    validations:
+      required: false

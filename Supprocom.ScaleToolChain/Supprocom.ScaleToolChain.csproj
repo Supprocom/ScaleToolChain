@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>Supprocom.ScaleToolChain</AssemblyName>
+    <RootNamespace>Supprocom.ScaleToolChain</RootNamespace>
+    <PackageId>Supprocom.ScaleToolChain</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>Supprocom</Authors>
+    <Company>Supprocom</Company>
+    <Description>Invoke the installed SCALE compiler for explicit AMD or NVIDIA targets.</Description>
+    <PackageTags>CUDA;SCALE;AMD;NVIDIA;compiler</PackageTags>
+    <PackageLicenseExpression>AGPL-3.0-only</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/Supprocom/ScaleToolChain</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Supprocom/ScaleToolChain</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <Deterministic>true</Deterministic>
+    <DebugType>portable</DebugType>
+    <DebugSymbols>true</DebugSymbols>
+    <IsPackable>true</IsPackable>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\LICENSE.md" Pack="true" PackagePath="LICENSE.md" />
+    <InternalsVisibleTo Include="Supprocom.ScaleToolChain.Tests" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="Supprocom.ScaleToolChain\Supprocom.ScaleToolChain.csproj" />
+  <Project Path="Supprocom.ScaleToolChain.Tests\Supprocom.ScaleToolChain.Tests.csproj" />
+  <Project Path="Supprocom.ScaleToolChain.FakeCompiler\Supprocom.ScaleToolChain.FakeCompiler.csproj" />
+</Solution>
