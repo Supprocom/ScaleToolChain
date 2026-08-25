@@ -165,7 +165,7 @@ public static class ScaleCompiler
         var completedDiagnostics = await ReadDiagnosticsAsync(standardOutputTask, standardErrorTask).ConfigureAwait(false);
         var duration = Stopwatch.GetElapsedTime(start);
         var producedOutputPaths = validated.OutputPaths.Where(File.Exists).ToArray();
-        var outputHashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var outputHashes = new Dictionary<string, string>(OutputPathComparer);
         foreach (var outputPath in producedOutputPaths)
         {
             outputHashes[outputPath] = await ComputeSha256Async(outputPath, CancellationToken.None).ConfigureAwait(false);
@@ -181,7 +181,7 @@ public static class ScaleCompiler
                 completedDiagnostics,
                 duration,
                 Array.Empty<string>(),
-                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+                new Dictionary<string, string>(OutputPathComparer),
                 outputCleanupFailure);
         }
 
@@ -870,6 +870,9 @@ public static class ScaleCompiler
 
     private static string? FirstOutput(IReadOnlyList<string> outputPaths) =>
         outputPaths.Count == 0 ? null : outputPaths[0];
+
+    private static StringComparer OutputPathComparer =>
+        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
 
     private enum WslProcessGroupState
     {
