@@ -71,6 +71,15 @@ Task CommandConstructionAsync()
         "ALPHA=one", "ZED=two words", "/opt/scale/llvm/bin/nvcc", "--require-scale",
         "--gpu-architecture=gfx1201", "-c", "/mnt/d/Temp Folder/input.cu", "-o", "/mnt/d/Temp Folder/output.o");
     AssertEqual("/mnt/d/Temp Folder/input.cu", ScaleCommandBuilder.WindowsToWslPath(@"D:\Temp Folder\input.cu"));
+
+    var nvidiaInvocation = ScaleCommandBuilder.Build(
+        settings.CompilerPath,
+        ScaleGpuTarget.Nvidia("sm_86"),
+        @"D:\Temp Folder\input.cu",
+        @"D:\Temp Folder\output.o",
+        @"D:\Temp Folder",
+        settings);
+    AssertEqual("--gpu-architecture=sm_86", nvidiaInvocation.Arguments[10]);
     return Task.CompletedTask;
 }
 
