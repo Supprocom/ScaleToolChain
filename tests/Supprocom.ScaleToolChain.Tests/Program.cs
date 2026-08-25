@@ -22,6 +22,8 @@ await RunAsync("failed compilation diagnostics", FailedCompilationAsync);
 await RunAsync("timeout process cleanup", TimeoutCleanupAsync);
 await RunAsync("configuration validation", ConfigurationValidationAsync);
 await RunOptionalRealWslGateAsync();
+await RunOptionalRealWslNvidiaGateAsync();
+await RunOptionalRealWslTimeoutAsync();
 Console.WriteLine($"Passed {passed} test groups.");
 
 return 0;
@@ -36,9 +38,15 @@ async Task RunAsync(string name, Func<Task> test)
 Task TargetValidationAsync()
 {
     AssertEqual("gfx1201", ScaleGpuTarget.Amd("gfx1201").Architecture);
+    AssertEqual("gfx90a", ScaleGpuTarget.Amd("gfx90a").Architecture);
     AssertEqual("sm_86", ScaleGpuTarget.Nvidia("sm_86").Architecture);
+    AssertEqual("sm_90a", ScaleGpuTarget.Nvidia("sm_90a").Architecture);
     AssertThrowsSync<ArgumentException>(() => ScaleGpuTarget.Amd("sm_86"));
     AssertThrowsSync<ArgumentException>(() => ScaleGpuTarget.Nvidia("gfx1201"));
+    AssertThrowsSync<ArgumentException>(() => ScaleGpuTarget.Amd("gfx90-a"));
+    AssertThrowsSync<ArgumentException>(() => ScaleGpuTarget.Amd("gfxabc"));
+    AssertThrowsSync<ArgumentException>(() => ScaleGpuTarget.Nvidia("sm_90a/extra"));
+    AssertThrowsSync<ArgumentException>(() => ScaleGpuTarget.Amd("--gpu-architecture=gfx90a"));
     return Task.CompletedTask;
 }
 
@@ -67,10 +75,12 @@ Task CommandConstructionAsync()
     AssertEqual("wsl.exe", invocation.ProcessPath);
     AssertSequence(
         invocation.Arguments,
-        "--distribution", "Ubuntu-24.04", "--cd", "/mnt/d/Temp Folder", "--", "/usr/bin/env",
+        "--distribution", "Ubuntu-24.04", "--cd", "/mnt/d/Temp Folder", "--exec", "/usr/bin/setsid", "--wait",
+        "/bin/sh", "-c", "printf '__SCALE_TOOLCHAIN_PID__:%s\\n' \"$$\"; exec /usr/bin/env \"$@\"", "scale-toolchain",
         "ALPHA=one", "ZED=two words", "/opt/scale/llvm/bin/nvcc", "--require-scale",
         "--gpu-architecture=gfx1201", "-c", "/mnt/d/Temp Folder/input.cu", "-o", "/mnt/d/Temp Folder/output.o");
     AssertEqual("/mnt/d/Temp Folder/input.cu", ScaleCommandBuilder.WindowsToWslPath(@"D:\Temp Folder\input.cu"));
+    AssertEqual(ScaleCommandBuilder.WslPidMarker, invocation.WslPidMarker);
 
     var nvidiaInvocation = ScaleCommandBuilder.Build(
         settings.CompilerPath,
@@ -79,7 +89,30 @@ Task CommandConstructionAsync()
         @"D:\Temp Folder\output.o",
         @"D:\Temp Folder",
         settings);
-    AssertEqual("--gpu-architecture=sm_86", nvidiaInvocation.Arguments[10]);
+    AssertEqual("--gpu-architecture=sm_86", nvidiaInvocation.Arguments[15]);
+
+    var configuredSettings = settings with
+    {
+        CudaToolkitPath = "/usr/local/cuda-12.9",
+        IncludePaths = new[] { "/opt/include" },
+        Definitions = new Dictionary<string, string>
+        {
+            ["ZED_DEFINE"] = "two words",
+            ["ALPHA_DEFINE"] = "1"
+        }
+    };
+    var configuredInvocation = ScaleCommandBuilder.Build(
+        configuredSettings.CompilerPath,
+        configuredSettings.Target,
+        @"D:\Temp Folder\input.cu",
+        @"D:\Temp Folder\output.o",
+        @"D:\Temp Folder",
+        configuredSettings);
+    AssertSequence(
+        configuredInvocation.Arguments.Skip(13).ToArray(),
+        "/opt/scale/llvm/bin/nvcc", "--cuda-path=/usr/local/cuda-12.9", "-I", "/opt/include",
+        "-D", "ALPHA_DEFINE=1", "-D", "ZED_DEFINE=two words", "--require-scale", "--gpu-architecture=gfx1201",
+        "-c", "/mnt/d/Temp Folder/input.cu", "-o", "/mnt/d/Temp Folder/output.o");
     return Task.CompletedTask;
 }
 
@@ -168,6 +201,18 @@ Task ConfigurationValidationAsync()
                 ExecutionMode = ScaleExecutionMode.Wsl
             }
         }));
+    AssertThrows<ScaleConfigurationException>(() => ScaleCompiler.CompileAsync(
+        new ScaleCompilationRequest
+        {
+            SourcePath = sourcePath,
+            OutputPath = outputPath,
+            Settings = new ScaleCompilationSettings
+            {
+                CompilerPath = fakeCompilerPath,
+                Target = ScaleGpuTarget.Amd("gfx1201"),
+                Environment = new Dictionary<string, string> { ["NVCC_PREPEND_FLAGS"] = "-o unsafe.o" }
+            }
+        }));
     return Task.CompletedTask;
 }
 
@@ -181,7 +226,13 @@ async Task RunOptionalRealWslGateAsync()
         return;
     }
 
-    var outputPath = NewOutputPath("real-gfx1201.o");
+    await RunRealWslGateAsync(distribution, compiler, "gfx1201");
+    await RunRealWslGateAsync(distribution, compiler, "gfx90a");
+}
+
+async Task RunRealWslGateAsync(string distribution, string compiler, string architecture)
+{
+    var outputPath = NewOutputPath($"real-{architecture}.o");
     var result = await ScaleCompiler.CompileAsync(new ScaleCompilationRequest
     {
         SourcePath = sourcePath,
@@ -189,7 +240,7 @@ async Task RunOptionalRealWslGateAsync()
         Settings = new ScaleCompilationSettings
         {
             CompilerPath = compiler,
-            Target = ScaleGpuTarget.Amd("gfx1201"),
+            Target = ScaleGpuTarget.Amd(architecture),
             ExecutionMode = ScaleExecutionMode.Wsl,
             WslDistribution = distribution,
             Timeout = TimeSpan.FromMinutes(2),
@@ -203,7 +254,212 @@ async Task RunOptionalRealWslGateAsync()
     Assert(File.Exists(outputPath), "The real WSL SCALE gate must create output.");
     Assert(!string.IsNullOrWhiteSpace(result.OutputSha256), "The real WSL SCALE gate must return an output hash.");
     passed++;
-    Console.WriteLine("PASS real WSL SCALE gate");
+    Console.WriteLine($"PASS real WSL SCALE gate {architecture}");
+}
+
+async Task RunOptionalRealWslNvidiaGateAsync()
+{
+    var distribution = Environment.GetEnvironmentVariable("SCALE_REAL_WSL_DISTRIBUTION");
+    var compiler = Environment.GetEnvironmentVariable("SCALE_REAL_WSL_COMPILER");
+    if (!OperatingSystem.IsWindows() || string.IsNullOrWhiteSpace(distribution) || string.IsNullOrWhiteSpace(compiler))
+    {
+        Console.WriteLine("SKIP real NVIDIA SCALE gate");
+        return;
+    }
+
+    var outputPath = NewOutputPath("real-sm_86.o");
+    var result = await ScaleCompiler.CompileAsync(new ScaleCompilationRequest
+    {
+        SourcePath = sourcePath,
+        OutputPath = outputPath,
+        Settings = new ScaleCompilationSettings
+        {
+            CompilerPath = compiler,
+            Target = ScaleGpuTarget.Nvidia("sm_86"),
+            ExecutionMode = ScaleExecutionMode.Wsl,
+            WslDistribution = distribution,
+            CudaToolkitPath = "/usr/local/cuda-12.9",
+            Timeout = TimeSpan.FromMinutes(2),
+            Environment = new Dictionary<string, string>
+            {
+                ["PATH"] = "/usr/local/bin:/usr/bin:/bin"
+            }
+        }
+    });
+    Assert(result.Succeeded, "The real NVIDIA SCALE gate must succeed when enabled.");
+    Assert(File.Exists(outputPath), "The real NVIDIA SCALE gate must create output.");
+    Assert(!string.IsNullOrWhiteSpace(result.OutputSha256), "The real NVIDIA SCALE gate must return an output hash.");
+    passed++;
+    Console.WriteLine("PASS real NVIDIA SCALE gate sm_86");
+}
+
+async Task RunOptionalRealWslTimeoutAsync()
+{
+    var distribution = Environment.GetEnvironmentVariable("SCALE_REAL_WSL_DISTRIBUTION");
+    if (!OperatingSystem.IsWindows() || string.IsNullOrWhiteSpace(distribution))
+    {
+        Console.WriteLine("SKIP real WSL timeout gate");
+        return;
+    }
+
+    var timeoutScriptPath = Path.Combine(testRoot, "wsl-timeout-compiler.sh");
+    var unrelatedScriptPath = Path.Combine(testRoot, "wsl-unrelated-process.sh");
+    var compilerPidPath = Path.Combine(testRoot, "wsl-compiler-pid.txt");
+    var childPidPath = Path.Combine(testRoot, "wsl-child-pid.txt");
+    var unrelatedPidPath = Path.Combine(testRoot, "wsl-unrelated-pid.txt");
+    var outputPath = NewOutputPath("wsl-timeout.o");
+    await File.WriteAllTextAsync(
+        timeoutScriptPath,
+        "#!/bin/sh\n" +
+        "set -u\n" +
+        "output=''\n" +
+        "while [ \"$#\" -gt 0 ]; do\n" +
+        "  if [ \"$1\" = \"-o\" ]; then output=\"$2\"; shift 2; else shift; fi\n" +
+        "done\n" +
+        "printf '%s\\n' \"$$\" > \"$SCALE_TEST_PID_FILE\"\n" +
+        "(sleep 600) &\n" +
+        "child=\"$!\"\n" +
+        "printf '%s\\n' \"$child\" > \"$SCALE_CHILD_PID_FILE\"\n" +
+        "trap 'exit 143' TERM INT\n" +
+        "sleep 3\n" +
+        "printf 'late output' > \"$output\"\n" +
+        "sleep 600\n",
+        new UTF8Encoding(false));
+    await File.WriteAllTextAsync(
+        unrelatedScriptPath,
+        "#!/bin/sh\n" +
+        "printf '%s\\n' \"$$\" > \"$SCALE_UNRELATED_PID_FILE\"\n" +
+        "sleep 600\n",
+        new UTF8Encoding(false));
+    var timeoutScriptWslPath = ScaleCommandBuilder.WindowsToWslPath(timeoutScriptPath);
+    var unrelatedScriptWslPath = ScaleCommandBuilder.WindowsToWslPath(unrelatedScriptPath);
+    var compilerPidWslPath = ScaleCommandBuilder.WindowsToWslPath(compilerPidPath);
+    var childPidWslPath = ScaleCommandBuilder.WindowsToWslPath(childPidPath);
+    var unrelatedPidWslPath = ScaleCommandBuilder.WindowsToWslPath(unrelatedPidPath);
+    await RunWslCommandAsync(distribution, "/bin/chmod", "+x", timeoutScriptWslPath);
+    await RunWslCommandAsync(distribution, "/bin/chmod", "+x", unrelatedScriptWslPath);
+
+    using var unrelatedProcess = StartWslProcess(
+        distribution,
+        "/usr/bin/env",
+        $"SCALE_UNRELATED_PID_FILE={unrelatedPidWslPath}",
+        unrelatedScriptWslPath);
+    await WaitForFileAsync(unrelatedPidPath);
+    var unrelatedPid = int.Parse(
+        await File.ReadAllTextAsync(unrelatedPidPath, Encoding.UTF8),
+        System.Globalization.CultureInfo.InvariantCulture);
+    Assert(await IsWslProcessRunningAsync(distribution, unrelatedPid), "The unrelated WSL process must start.");
+
+    var exception = await AssertThrowsAsync<ScaleCompilationTimeoutException>(() => ScaleCompiler.CompileAsync(
+        new ScaleCompilationRequest
+        {
+            SourcePath = sourcePath,
+            OutputPath = outputPath,
+            Settings = new ScaleCompilationSettings
+            {
+                CompilerPath = timeoutScriptWslPath,
+                Target = ScaleGpuTarget.Amd("gfx1201"),
+                ExecutionMode = ScaleExecutionMode.Wsl,
+                WslDistribution = distribution,
+                Timeout = TimeSpan.FromMilliseconds(500),
+                Environment = new Dictionary<string, string>
+                {
+                    ["PATH"] = "/usr/local/bin:/usr/bin:/bin",
+                    ["SCALE_TEST_PID_FILE"] = compilerPidWslPath,
+                    ["SCALE_CHILD_PID_FILE"] = childPidWslPath
+                }
+            }
+        }));
+    AssertEqual(TimeSpan.FromMilliseconds(500), exception.Timeout);
+    await WaitForFileAsync(compilerPidPath);
+    await WaitForFileAsync(childPidPath);
+    var compilerPid = int.Parse(
+        await File.ReadAllTextAsync(compilerPidPath, Encoding.UTF8),
+        System.Globalization.CultureInfo.InvariantCulture);
+    var childPid = int.Parse(
+        await File.ReadAllTextAsync(childPidPath, Encoding.UTF8),
+        System.Globalization.CultureInfo.InvariantCulture);
+    await Task.Delay(500);
+    Assert(!await IsWslProcessRunningAsync(distribution, compilerPid), "The timed-out WSL compiler must stop.");
+    Assert(!await IsWslProcessRunningAsync(distribution, childPid), "The timed-out WSL child must stop.");
+    Assert(await IsWslProcessRunningAsync(distribution, unrelatedPid), "The unrelated WSL process must remain active.");
+    await Task.Delay(3500);
+    Assert(!File.Exists(outputPath), "A stopped WSL compiler must not create output later.");
+    await RunWslCommandAsync(distribution, "/bin/kill", "-TERM", unrelatedPid.ToString(System.Globalization.CultureInfo.InvariantCulture));
+    passed++;
+    Console.WriteLine("PASS real WSL timeout gate");
+}
+
+async Task WaitForFileAsync(string path)
+{
+    for (var attempt = 0; attempt < 20 && !File.Exists(path); attempt++)
+    {
+        await Task.Delay(100);
+    }
+
+    Assert(File.Exists(path), $"Expected the process marker file: {path}");
+}
+
+Process StartWslProcess(string distribution, params string[] command)
+{
+    var startInfo = new ProcessStartInfo
+    {
+        FileName = "wsl.exe",
+        WorkingDirectory = testRoot,
+        UseShellExecute = false,
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        CreateNoWindow = true
+    };
+    startInfo.ArgumentList.Add("--distribution");
+    startInfo.ArgumentList.Add(distribution);
+    startInfo.ArgumentList.Add("--exec");
+    foreach (var argument in command)
+    {
+        startInfo.ArgumentList.Add(argument);
+    }
+    return Process.Start(startInfo) ?? throw new InvalidOperationException("The WSL process did not start.");
+}
+
+async Task<(int ExitCode, string StandardOutput, string StandardError)> RunWslCommandAsync(
+    string distribution,
+    params string[] command)
+{
+    var startInfo = new ProcessStartInfo
+    {
+        FileName = "wsl.exe",
+        WorkingDirectory = testRoot,
+        UseShellExecute = false,
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        CreateNoWindow = true
+    };
+    startInfo.ArgumentList.Add("--distribution");
+    startInfo.ArgumentList.Add(distribution);
+    startInfo.ArgumentList.Add("--exec");
+    foreach (var argument in command)
+    {
+        startInfo.ArgumentList.Add(argument);
+    }
+
+    using var process = Process.Start(startInfo) ?? throw new InvalidOperationException("The WSL command did not start.");
+    var standardOutputTask = process.StandardOutput.ReadToEndAsync();
+    var standardErrorTask = process.StandardError.ReadToEndAsync();
+    await process.WaitForExitAsync();
+    return (process.ExitCode, await standardOutputTask, await standardErrorTask);
+}
+
+async Task<bool> IsWslProcessRunningAsync(string distribution, int processId)
+{
+    var result = await RunWslCommandAsync(
+        distribution,
+        "/bin/ps",
+        "-p",
+        processId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        "-o",
+        "stat=");
+    var state = result.StandardOutput.Trim();
+    return state.Length > 0 && !state.StartsWith('Z');
 }
 
 async Task<ScaleCompilationResult> CompileAsync(

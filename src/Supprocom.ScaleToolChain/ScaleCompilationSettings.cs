@@ -21,6 +21,13 @@ public sealed record ScaleCompilationSettings
     public IReadOnlyDictionary<string, string> Environment { get; init; } =
         new Dictionary<string, string>(StringComparer.Ordinal);
 
+    public string? CudaToolkitPath { get; init; }
+
+    public IReadOnlyList<string> IncludePaths { get; init; } = Array.Empty<string>();
+
+    public IReadOnlyDictionary<string, string> Definitions { get; init; } =
+        new Dictionary<string, string>(StringComparer.Ordinal);
+
     public TimeSpan Timeout { get; init; } = TimeSpan.FromMinutes(5);
 
     public string? WorkingDirectory { get; init; }

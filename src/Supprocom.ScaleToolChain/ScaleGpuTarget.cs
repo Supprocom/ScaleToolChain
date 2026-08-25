@@ -55,6 +55,8 @@ public sealed record ScaleGpuTarget
             return false;
         }
 
-        return architecture[prefix.Length..].All(static character => character is >= '0' and <= '9');
+        var suffix = architecture[prefix.Length..];
+        return suffix[0] is >= '0' and <= '9' &&
+            suffix[1..].All(static character => character is >= '0' and <= '9' or >= 'a' and <= 'z');
     }
 }

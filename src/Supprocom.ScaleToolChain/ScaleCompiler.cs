@@ -46,6 +46,9 @@ public static class ScaleCompiler
             StartInfo = startInfo,
             EnableRaisingEvents = true
         };
+        var linuxPidSource = invocation.WslPidMarker is null
+            ? null
+            : new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         try
         {
@@ -70,7 +73,7 @@ public static class ScaleCompiler
                 innerException: exception);
         }
 
-        var standardOutputTask = process.StandardOutput.ReadToEndAsync(CancellationToken.None);
+        var standardOutputTask = ReadStandardOutputAsync(process.StandardOutput, invocation, linuxPidSource);
         var standardErrorTask = process.StandardError.ReadToEndAsync(CancellationToken.None);
         using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeoutSource.CancelAfter(validated.Settings.Timeout);
@@ -81,8 +84,8 @@ public static class ScaleCompiler
         }
         catch (OperationCanceledException exception) when (!cancellationToken.IsCancellationRequested)
         {
-            await StopProcessTreeAsync(process).ConfigureAwait(false);
-            var diagnostics = await ReadDiagnosticsAsync(standardOutputTask, standardErrorTask).ConfigureAwait(false);
+            await StopProcessAsync(process, invocation, linuxPidSource).ConfigureAwait(false);
+            var diagnostics = await ReadDiagnosticsAsync(standardOutputTask, standardErrorTask, TimeSpan.FromSeconds(2)).ConfigureAwait(false);
             DeleteFailedOutput(validated.OutputPath);
             throw new ScaleCompilationTimeoutException(
                 validated.Settings.Timeout,
@@ -94,8 +97,8 @@ public static class ScaleCompiler
         }
         catch (OperationCanceledException)
         {
-            await StopProcessTreeAsync(process).ConfigureAwait(false);
-            await ReadDiagnosticsAsync(standardOutputTask, standardErrorTask).ConfigureAwait(false);
+            await StopProcessAsync(process, invocation, linuxPidSource).ConfigureAwait(false);
+            await ReadDiagnosticsAsync(standardOutputTask, standardErrorTask, TimeSpan.FromSeconds(2)).ConfigureAwait(false);
             DeleteFailedOutput(validated.OutputPath);
             throw;
         }
@@ -198,6 +201,12 @@ public static class ScaleCompiler
         }
 
         ValidateEnvironment(request.Settings.Environment);
+        var cudaToolkitPath = ValidateToolchainPath(
+            request.Settings.CudaToolkitPath,
+            request.Settings.ExecutionMode,
+            "CUDA toolkit path");
+        var includePaths = ValidateIncludePaths(request.Settings.IncludePaths, request.Settings.ExecutionMode);
+        ValidateDefinitions(request.Settings.Definitions);
 
         var sourcePath = RequireAbsolutePath(request.SourcePath, "The CUDA source path must be absolute.");
         var outputPath = RequireAbsolutePath(request.OutputPath, "The output path must be absolute.");
@@ -251,7 +260,9 @@ public static class ScaleCompiler
         var settings = request.Settings with
         {
             CompilerPath = compilerPath,
-            WorkingDirectory = workingDirectory
+            WorkingDirectory = workingDirectory,
+            CudaToolkitPath = cudaToolkitPath,
+            IncludePaths = includePaths
         };
 
         return new ValidatedRequest(sourcePath, outputPath, compilerPath, request.Settings.Target, workingDirectory, settings);
@@ -336,9 +347,83 @@ public static class ScaleCompiler
 
         foreach (var pair in environment)
         {
-            if (!IsValidEnvironmentName(pair.Key) || pair.Value is null || pair.Value.Contains('\0'))
+            if (!IsValidEnvironmentName(pair.Key) || IsReservedCompilerEnvironment(pair.Key) || pair.Value is null || pair.Value.Contains('\0'))
             {
                 throw new ScaleConfigurationException($"The compiler environment entry '{pair.Key}' is not valid.");
+            }
+        }
+    }
+
+    private static bool IsReservedCompilerEnvironment(string name) => name switch
+    {
+        "CUDA_CXX" or "CUDACXX" or "CUDA_NVCC_EXECUTABLE" or "CUCC" or "NVCC_PREPEND_FLAGS" or "NVCC_APPEND_FLAGS" => true,
+        _ => false
+    };
+
+    private static string? ValidateToolchainPath(
+        string? path,
+        ScaleExecutionMode executionMode,
+        string settingName)
+    {
+        if (path is null)
+        {
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(path) || path.Contains('\0'))
+        {
+            throw new ScaleConfigurationException($"The {settingName} must be an absolute path.");
+        }
+
+        if (executionMode == ScaleExecutionMode.Wsl && IsPosixAbsolutePath(path))
+        {
+            return path;
+        }
+
+        var absolutePath = RequireAbsolutePath(path, $"The {settingName} must be an absolute path.");
+        if (executionMode == ScaleExecutionMode.Wsl && !IsWindowsDriveAbsolutePath(absolutePath))
+        {
+            throw new ScaleConfigurationException($"The {settingName} must be an absolute POSIX or Windows path for WSL execution.");
+        }
+
+        if (!Directory.Exists(absolutePath))
+        {
+            throw new ScaleConfigurationException($"The {settingName} does not exist: {absolutePath}");
+        }
+
+        return absolutePath;
+    }
+
+    private static System.Collections.ObjectModel.ReadOnlyCollection<string> ValidateIncludePaths(
+        IReadOnlyList<string> includePaths,
+        ScaleExecutionMode executionMode)
+    {
+        if (includePaths is null)
+        {
+            throw new ScaleConfigurationException("The include path collection cannot be null.");
+        }
+
+        var normalized = new List<string>(includePaths.Count);
+        foreach (var includePath in includePaths)
+        {
+            normalized.Add(ValidateToolchainPath(includePath, executionMode, "include path")!);
+        }
+
+        return Array.AsReadOnly(normalized.ToArray());
+    }
+
+    private static void ValidateDefinitions(IReadOnlyDictionary<string, string> definitions)
+    {
+        if (definitions is null)
+        {
+            throw new ScaleConfigurationException("The definition collection cannot be null.");
+        }
+
+        foreach (var definition in definitions)
+        {
+            if (!IsValidEnvironmentName(definition.Key) || definition.Value is null || definition.Value.Contains('\0'))
+            {
+                throw new ScaleConfigurationException($"The definition '{definition.Key}' is not valid.");
             }
         }
     }
@@ -366,6 +451,8 @@ public static class ScaleCompiler
     private static bool IsWindowsDriveAbsolutePath(string path) =>
         path.Length >= 3 && char.IsLetter(path[0]) && path[1] == ':' && (path[2] == '\\' || path[2] == '/');
 
+    private static bool IsPosixAbsolutePath(string path) => path.StartsWith('/');
+
     private static async Task<string> ComputeSha256Async(string path, CancellationToken cancellationToken)
     {
         await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, useAsync: true);
@@ -373,20 +460,166 @@ public static class ScaleCompiler
         return Convert.ToHexString(hash);
     }
 
-    private static async Task<Diagnostics> ReadDiagnosticsAsync(Task<string> standardOutputTask, Task<string> standardErrorTask)
+    private static async Task<string> ReadStandardOutputAsync(
+        StreamReader reader,
+        ScaleProcessInvocation invocation,
+        TaskCompletionSource<int>? linuxPidSource)
     {
-        await Task.WhenAll(standardOutputTask, standardErrorTask).ConfigureAwait(false);
+        if (invocation.WslPidMarker is null || linuxPidSource is null)
+        {
+            return await reader.ReadToEndAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+
+        var firstLine = await reader.ReadLineAsync(CancellationToken.None).ConfigureAwait(false);
+        if (firstLine is not null &&
+            firstLine.StartsWith(invocation.WslPidMarker, StringComparison.Ordinal) &&
+            int.TryParse(
+                firstLine[invocation.WslPidMarker.Length..],
+                System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var linuxPid) &&
+            linuxPid > 0)
+        {
+            linuxPidSource.TrySetResult(linuxPid);
+            return await reader.ReadToEndAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+
+        linuxPidSource.TrySetResult(0);
+        var remaining = await reader.ReadToEndAsync(CancellationToken.None).ConfigureAwait(false);
+        return firstLine is null ? remaining : $"{firstLine}\n{remaining}";
+    }
+
+    private static async Task<Diagnostics> ReadDiagnosticsAsync(
+        Task<string> standardOutputTask,
+        Task<string> standardErrorTask,
+        TimeSpan? timeout = null)
+    {
+        var allDiagnostics = Task.WhenAll(standardOutputTask, standardErrorTask);
+        if (timeout is null)
+        {
+            await allDiagnostics.ConfigureAwait(false);
+        }
+        else if (await Task.WhenAny(allDiagnostics, Task.Delay(timeout.Value)).ConfigureAwait(false) != allDiagnostics)
+        {
+            return new Diagnostics(
+                standardOutputTask.IsCompletedSuccessfully ? standardOutputTask.Result : string.Empty,
+                standardErrorTask.IsCompletedSuccessfully ? standardErrorTask.Result : string.Empty);
+        }
+
         return new Diagnostics(standardOutputTask.Result, standardErrorTask.Result);
     }
 
-    private static async Task StopProcessTreeAsync(Process process)
+    private static async Task StopProcessAsync(
+        Process process,
+        ScaleProcessInvocation invocation,
+        TaskCompletionSource<int>? linuxPidSource)
+    {
+        if (invocation.WslDistribution is not null && linuxPidSource is not null)
+        {
+            var linuxPid = await WaitForLinuxPidAsync(linuxPidSource).ConfigureAwait(false);
+            if (linuxPid > 0)
+            {
+                await SendWslSignalAsync(invocation, linuxPid, "-TERM").ConfigureAwait(false);
+                await WaitForExitBoundedAsync(process, TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+                if (!process.HasExited)
+                {
+                    await SendWslSignalAsync(invocation, linuxPid, "-KILL").ConfigureAwait(false);
+                    await WaitForExitBoundedAsync(process, TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+                }
+            }
+        }
+
+        if (!process.HasExited)
+        {
+            KillProcessTree(process);
+            await WaitForExitBoundedAsync(process, TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task<int> WaitForLinuxPidAsync(TaskCompletionSource<int> linuxPidSource)
+    {
+        var completed = await Task.WhenAny(
+            linuxPidSource.Task,
+            Task.Delay(TimeSpan.FromMilliseconds(500))).ConfigureAwait(false);
+        return completed == linuxPidSource.Task ? await linuxPidSource.Task.ConfigureAwait(false) : 0;
+    }
+
+    private static async Task SendWslSignalAsync(
+        ScaleProcessInvocation invocation,
+        int linuxPid,
+        string signal)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = invocation.ProcessPath,
+            WorkingDirectory = invocation.WorkingDirectory,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+        startInfo.ArgumentList.Add("--distribution");
+        startInfo.ArgumentList.Add(invocation.WslDistribution!);
+        startInfo.ArgumentList.Add("--exec");
+        startInfo.ArgumentList.Add("/bin/kill");
+        startInfo.ArgumentList.Add(signal);
+        startInfo.ArgumentList.Add("--");
+        startInfo.ArgumentList.Add($"-{linuxPid}");
+
+        using var signalProcess = new Process { StartInfo = startInfo };
+        try
+        {
+            if (!signalProcess.Start())
+            {
+                return;
+            }
+
+            var standardOutputTask = signalProcess.StandardOutput.ReadToEndAsync(CancellationToken.None);
+            var standardErrorTask = signalProcess.StandardError.ReadToEndAsync(CancellationToken.None);
+            await WaitForExitBoundedAsync(signalProcess, TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+            await ReadDiagnosticsAsync(standardOutputTask, standardErrorTask, TimeSpan.FromSeconds(1)).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException)
+        {
+        }
+        catch (Win32Exception)
+        {
+        }
+    }
+
+    private static async Task<bool> WaitForExitBoundedAsync(Process process, TimeSpan timeout)
+    {
+        try
+        {
+            if (process.HasExited)
+            {
+                return true;
+            }
+
+            using var timeoutSource = new CancellationTokenSource(timeout);
+            try
+            {
+                await process.WaitForExitAsync(timeoutSource.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+
+            return process.HasExited;
+        }
+        catch (InvalidOperationException)
+        {
+            return true;
+        }
+    }
+
+    private static void KillProcessTree(Process process)
     {
         try
         {
             if (!process.HasExited)
             {
                 process.Kill(entireProcessTree: true);
-                await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
             }
         }
         catch (InvalidOperationException)
