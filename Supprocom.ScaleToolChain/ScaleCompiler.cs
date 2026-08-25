@@ -149,9 +149,11 @@ public static class ScaleCompiler
         catch (OperationCanceledException exception)
         {
             var processCleanupFailure = await StopProcessAsync(process, invocation, linuxPidSource).ConfigureAwait(false);
-            await ReadDiagnosticsAsync(standardOutputTask, standardErrorTask, TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+            var diagnostics = await ReadDiagnosticsAsync(standardOutputTask, standardErrorTask, TimeSpan.FromSeconds(2)).ConfigureAwait(false);
             var outputCleanupFailure = DeleteFailedOutputs(validated.OutputPaths);
             var cleanupFailure = CombineCleanupFailures(processCleanupFailure, outputCleanupFailure);
+            exception.Data[ScaleCompilationException.CancellationStandardOutputDataKey] = diagnostics.StandardOutput;
+            exception.Data[ScaleCompilationException.CancellationStandardErrorDataKey] = diagnostics.StandardError;
             if (cleanupFailure is not null)
             {
                 exception.Data[ScaleCompilationException.CleanupFailureDataKey] = cleanupFailure;
