@@ -84,7 +84,7 @@ public static class ScaleCompiler
         }
         catch (OperationCanceledException exception) when (!cancellationToken.IsCancellationRequested)
         {
-            await StopProcessAsync(process, invocation, linuxPidSource).ConfigureAwait(false);
+            var cleanupFailure = await StopProcessAsync(process, invocation, linuxPidSource).ConfigureAwait(false);
             var diagnostics = await ReadDiagnosticsAsync(standardOutputTask, standardErrorTask, TimeSpan.FromSeconds(2)).ConfigureAwait(false);
             DeleteFailedOutput(validated.OutputPath);
             throw new ScaleCompilationTimeoutException(
@@ -93,13 +93,19 @@ public static class ScaleCompiler
                 validated.OutputPath,
                 diagnostics.StandardOutput,
                 diagnostics.StandardError,
-                exception);
+                exception,
+                cleanupFailure);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException exception)
         {
-            await StopProcessAsync(process, invocation, linuxPidSource).ConfigureAwait(false);
+            var cleanupFailure = await StopProcessAsync(process, invocation, linuxPidSource).ConfigureAwait(false);
             await ReadDiagnosticsAsync(standardOutputTask, standardErrorTask, TimeSpan.FromSeconds(2)).ConfigureAwait(false);
             DeleteFailedOutput(validated.OutputPath);
+            if (cleanupFailure is not null)
+            {
+                exception.Data[ScaleCompilationException.CleanupFailureDataKey] = cleanupFailure;
+            }
+
             throw;
         }
 
@@ -509,11 +515,12 @@ public static class ScaleCompiler
         return new Diagnostics(standardOutputTask.Result, standardErrorTask.Result);
     }
 
-    private static async Task StopProcessAsync(
+    private static async Task<ScaleProcessCleanupException?> StopProcessAsync(
         Process process,
         ScaleProcessInvocation invocation,
         TaskCompletionSource<int>? linuxPidSource)
     {
+        ScaleProcessCleanupException? cleanupFailure = null;
         if (invocation.WslDistribution is not null && linuxPidSource is not null)
         {
             var linuxPid = await WaitForLinuxPidAsync(linuxPidSource).ConfigureAwait(false);
@@ -521,11 +528,32 @@ public static class ScaleCompiler
             {
                 await SendWslSignalAsync(invocation, linuxPid, "-TERM").ConfigureAwait(false);
                 await WaitForExitBoundedAsync(process, TimeSpan.FromSeconds(2)).ConfigureAwait(false);
-                if (!process.HasExited)
+                var groupState = await ProbeWslProcessGroupAsync(invocation, linuxPid).ConfigureAwait(false);
+                if (groupState == WslProcessGroupState.Present)
                 {
                     await SendWslSignalAsync(invocation, linuxPid, "-KILL").ConfigureAwait(false);
-                    await WaitForExitBoundedAsync(process, TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+                    if (!await WaitForWslProcessGroupAbsentAsync(invocation, linuxPid).ConfigureAwait(false))
+                    {
+                        cleanupFailure = new ScaleProcessCleanupException(
+                            "The SCALE Linux process group remained after KILL.",
+                            linuxPid,
+                            invocation.WslDistribution);
+                    }
                 }
+                else if (groupState == WslProcessGroupState.Unknown)
+                {
+                    cleanupFailure = new ScaleProcessCleanupException(
+                        "The SCALE Linux process group absence could not be confirmed.",
+                        linuxPid,
+                        invocation.WslDistribution);
+                }
+            }
+            else
+            {
+                cleanupFailure = new ScaleProcessCleanupException(
+                    "The SCALE Linux process group identifier was not received.",
+                    0,
+                    invocation.WslDistribution);
             }
         }
 
@@ -534,6 +562,8 @@ public static class ScaleCompiler
             KillProcessTree(process);
             await WaitForExitBoundedAsync(process, TimeSpan.FromSeconds(2)).ConfigureAwait(false);
         }
+
+        return cleanupFailure;
     }
 
     private static async Task<int> WaitForLinuxPidAsync(TaskCompletionSource<int> linuxPidSource)
@@ -544,10 +574,67 @@ public static class ScaleCompiler
         return completed == linuxPidSource.Task ? await linuxPidSource.Task.ConfigureAwait(false) : 0;
     }
 
-    private static async Task SendWslSignalAsync(
+    private static async Task<WslControlResult> SendWslSignalAsync(
         ScaleProcessInvocation invocation,
         int linuxPid,
         string signal)
+    {
+        return await RunWslControlAsync(
+            invocation,
+            "/bin/kill",
+            signal,
+            "--",
+            $"-{linuxPid}").ConfigureAwait(false);
+    }
+
+    private static async Task<WslProcessGroupState> ProbeWslProcessGroupAsync(
+        ScaleProcessInvocation invocation,
+        int linuxPid)
+    {
+        var result = await RunWslControlAsync(
+            invocation,
+            "/bin/kill",
+            "-0",
+            "--",
+            $"-{linuxPid}").ConfigureAwait(false);
+        if (!result.Started || result.TimedOut)
+        {
+            return WslProcessGroupState.Unknown;
+        }
+
+        return result.ExitCode switch
+        {
+            0 => WslProcessGroupState.Present,
+            1 => WslProcessGroupState.Absent,
+            _ => WslProcessGroupState.Unknown
+        };
+    }
+
+    private static async Task<bool> WaitForWslProcessGroupAbsentAsync(
+        ScaleProcessInvocation invocation,
+        int linuxPid)
+    {
+        var deadline = Stopwatch.GetTimestamp() + (long)(Stopwatch.Frequency * 2.0);
+        while (true)
+        {
+            var state = await ProbeWslProcessGroupAsync(invocation, linuxPid).ConfigureAwait(false);
+            if (state == WslProcessGroupState.Absent)
+            {
+                return true;
+            }
+
+            if (state == WslProcessGroupState.Unknown || Stopwatch.GetTimestamp() >= deadline)
+            {
+                return false;
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(100)).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task<WslControlResult> RunWslControlAsync(
+        ScaleProcessInvocation invocation,
+        params string[] arguments)
     {
         var startInfo = new ProcessStartInfo
         {
@@ -561,31 +648,49 @@ public static class ScaleCompiler
         startInfo.ArgumentList.Add("--distribution");
         startInfo.ArgumentList.Add(invocation.WslDistribution!);
         startInfo.ArgumentList.Add("--exec");
-        startInfo.ArgumentList.Add("/bin/kill");
-        startInfo.ArgumentList.Add(signal);
-        startInfo.ArgumentList.Add("--");
-        startInfo.ArgumentList.Add($"-{linuxPid}");
+        foreach (var argument in arguments)
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
 
-        using var signalProcess = new Process { StartInfo = startInfo };
+        using var controlProcess = new Process { StartInfo = startInfo };
         try
         {
-            if (!signalProcess.Start())
+            if (!controlProcess.Start())
             {
-                return;
+                return new WslControlResult(false, false, -1);
             }
 
-            var standardOutputTask = signalProcess.StandardOutput.ReadToEndAsync(CancellationToken.None);
-            var standardErrorTask = signalProcess.StandardError.ReadToEndAsync(CancellationToken.None);
-            await WaitForExitBoundedAsync(signalProcess, TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+            var standardOutputTask = controlProcess.StandardOutput.ReadToEndAsync(CancellationToken.None);
+            var standardErrorTask = controlProcess.StandardError.ReadToEndAsync(CancellationToken.None);
+            if (!await WaitForExitBoundedAsync(controlProcess, TimeSpan.FromSeconds(1)).ConfigureAwait(false))
+            {
+                KillProcessTree(controlProcess);
+                await WaitForExitBoundedAsync(controlProcess, TimeSpan.FromSeconds(1)).ConfigureAwait(false);
+                return new WslControlResult(true, true, -1);
+            }
+
             await ReadDiagnosticsAsync(standardOutputTask, standardErrorTask, TimeSpan.FromSeconds(1)).ConfigureAwait(false);
+            return new WslControlResult(true, false, controlProcess.ExitCode);
         }
         catch (InvalidOperationException)
         {
+            return new WslControlResult(false, false, -1);
         }
         catch (Win32Exception)
         {
+            return new WslControlResult(false, false, -1);
         }
     }
+
+    private enum WslProcessGroupState
+    {
+        Present,
+        Absent,
+        Unknown
+    }
+
+    private readonly record struct WslControlResult(bool Started, bool TimedOut, int ExitCode);
 
     private static async Task<bool> WaitForExitBoundedAsync(Process process, TimeSpan timeout)
     {

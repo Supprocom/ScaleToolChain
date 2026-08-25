@@ -1,1 +1,5 @@
 /docs/internal/
+/bin/
+/obj/
+/TestResults/
+*.csproj.user

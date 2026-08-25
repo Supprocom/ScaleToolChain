@@ -24,6 +24,7 @@ await RunAsync("configuration validation", ConfigurationValidationAsync);
 await RunOptionalRealWslGateAsync();
 await RunOptionalRealWslNvidiaGateAsync();
 await RunOptionalRealWslTimeoutAsync();
+await RunOptionalRealWslResistantTimeoutAsync();
 Console.WriteLine($"Passed {passed} test groups.");
 
 return 0;
@@ -371,6 +372,7 @@ async Task RunOptionalRealWslTimeoutAsync()
             }
         }));
     AssertEqual(TimeSpan.FromMilliseconds(500), exception.Timeout);
+    Assert(exception.CleanupFailure is null, "The normal WSL cleanup must confirm group absence.");
     await WaitForFileAsync(compilerPidPath);
     await WaitForFileAsync(childPidPath);
     var compilerPid = int.Parse(
@@ -388,6 +390,104 @@ async Task RunOptionalRealWslTimeoutAsync()
     await RunWslCommandAsync(distribution, "/bin/kill", "-TERM", unrelatedPid.ToString(System.Globalization.CultureInfo.InvariantCulture));
     passed++;
     Console.WriteLine("PASS real WSL timeout gate");
+}
+
+async Task RunOptionalRealWslResistantTimeoutAsync()
+{
+    var distribution = Environment.GetEnvironmentVariable("SCALE_REAL_WSL_DISTRIBUTION");
+    if (!OperatingSystem.IsWindows() || string.IsNullOrWhiteSpace(distribution))
+    {
+        Console.WriteLine("SKIP real WSL TERM-resistant timeout gate");
+        return;
+    }
+
+    var timeoutScriptPath = Path.Combine(testRoot, "wsl-term-resistant-compiler.sh");
+    var unrelatedScriptPath = Path.Combine(testRoot, "wsl-term-resistant-unrelated.sh");
+    var compilerPidPath = Path.Combine(testRoot, "wsl-term-resistant-compiler-pid.txt");
+    var childPidPath = Path.Combine(testRoot, "wsl-term-resistant-child-pid.txt");
+    var unrelatedPidPath = Path.Combine(testRoot, "wsl-term-resistant-unrelated-pid.txt");
+    var outputPath = NewOutputPath("wsl-term-resistant-timeout.o");
+    await File.WriteAllTextAsync(
+        timeoutScriptPath,
+        "#!/bin/sh\n" +
+        "set -u\n" +
+        "output=''\n" +
+        "while [ \"$#\" -gt 0 ]; do\n" +
+        "  if [ \"$1\" = \"-o\" ]; then output=\"$2\"; shift 2; else shift; fi\n" +
+        "done\n" +
+        "printf '%s\\n' \"$$\" > \"$SCALE_TEST_PID_FILE\"\n" +
+        "(trap '' TERM INT; sleep 600) &\n" +
+        "child=\"$!\"\n" +
+        "printf '%s\\n' \"$child\" > \"$SCALE_CHILD_PID_FILE\"\n" +
+        "trap 'exit 143' TERM INT\n" +
+        "sleep 3\n" +
+        "printf 'late output' > \"$output\"\n" +
+        "sleep 600\n",
+        new UTF8Encoding(false));
+    await File.WriteAllTextAsync(
+        unrelatedScriptPath,
+        "#!/bin/sh\n" +
+        "printf '%s\\n' \"$$\" > \"$SCALE_UNRELATED_PID_FILE\"\n" +
+        "sleep 600\n",
+        new UTF8Encoding(false));
+    var timeoutScriptWslPath = ScaleCommandBuilder.WindowsToWslPath(timeoutScriptPath);
+    var unrelatedScriptWslPath = ScaleCommandBuilder.WindowsToWslPath(unrelatedScriptPath);
+    var compilerPidWslPath = ScaleCommandBuilder.WindowsToWslPath(compilerPidPath);
+    var childPidWslPath = ScaleCommandBuilder.WindowsToWslPath(childPidPath);
+    var unrelatedPidWslPath = ScaleCommandBuilder.WindowsToWslPath(unrelatedPidPath);
+    await RunWslCommandAsync(distribution, "/bin/chmod", "+x", timeoutScriptWslPath);
+    await RunWslCommandAsync(distribution, "/bin/chmod", "+x", unrelatedScriptWslPath);
+
+    using var unrelatedProcess = StartWslProcess(
+        distribution,
+        "/usr/bin/env",
+        $"SCALE_UNRELATED_PID_FILE={unrelatedPidWslPath}",
+        unrelatedScriptWslPath);
+    await WaitForFileAsync(unrelatedPidPath);
+    var unrelatedPid = int.Parse(
+        await File.ReadAllTextAsync(unrelatedPidPath, Encoding.UTF8),
+        System.Globalization.CultureInfo.InvariantCulture);
+    Assert(await IsWslProcessRunningAsync(distribution, unrelatedPid), "The unrelated WSL process must start.");
+
+    var exception = await AssertThrowsAsync<ScaleCompilationTimeoutException>(() => ScaleCompiler.CompileAsync(
+        new ScaleCompilationRequest
+        {
+            SourcePath = sourcePath,
+            OutputPath = outputPath,
+            Settings = new ScaleCompilationSettings
+            {
+                CompilerPath = timeoutScriptWslPath,
+                Target = ScaleGpuTarget.Amd("gfx1201"),
+                ExecutionMode = ScaleExecutionMode.Wsl,
+                WslDistribution = distribution,
+                Timeout = TimeSpan.FromMilliseconds(500),
+                Environment = new Dictionary<string, string>
+                {
+                    ["PATH"] = "/usr/local/bin:/usr/bin:/bin",
+                    ["SCALE_TEST_PID_FILE"] = compilerPidWslPath,
+                    ["SCALE_CHILD_PID_FILE"] = childPidWslPath
+                }
+            }
+        }));
+    AssertEqual(TimeSpan.FromMilliseconds(500), exception.Timeout);
+    Assert(exception.CleanupFailure is null, "The TERM-resistant WSL cleanup must confirm group absence.");
+    await WaitForFileAsync(compilerPidPath);
+    await WaitForFileAsync(childPidPath);
+    var compilerPid = int.Parse(
+        await File.ReadAllTextAsync(compilerPidPath, Encoding.UTF8),
+        System.Globalization.CultureInfo.InvariantCulture);
+    var childPid = int.Parse(
+        await File.ReadAllTextAsync(childPidPath, Encoding.UTF8),
+        System.Globalization.CultureInfo.InvariantCulture);
+    await Task.Delay(500);
+    Assert(!await IsWslProcessRunningAsync(distribution, compilerPid), "The TERM-resistant WSL compiler must stop.");
+    Assert(!await IsWslProcessRunningAsync(distribution, childPid), "The TERM-resistant WSL child must stop.");
+    Assert(await IsWslProcessRunningAsync(distribution, unrelatedPid), "The unrelated WSL process must remain active.");
+    await Task.Delay(3500);
+    Assert(!File.Exists(outputPath), "A stopped TERM-resistant compiler must not create output later.");
+    await RunWslCommandAsync(distribution, "/bin/kill", "-TERM", unrelatedPid.ToString(System.Globalization.CultureInfo.InvariantCulture));
+    passed++;
+    Console.WriteLine("PASS real WSL TERM-resistant timeout gate");
 }
 
 async Task WaitForFileAsync(string path)

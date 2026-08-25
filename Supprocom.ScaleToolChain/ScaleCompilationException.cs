@@ -2,6 +2,8 @@ namespace Supprocom.ScaleToolChain;
 
 public class ScaleCompilationException : Exception
 {
+    public const string CleanupFailureDataKey = "Supprocom.ScaleToolChain.CleanupFailure";
+
     public ScaleCompilationException(
         string message,
         string? sourcePath = null,
@@ -28,6 +30,8 @@ public class ScaleCompilationException : Exception
     public string StandardOutput { get; }
 
     public string StandardError { get; }
+
+    public Exception? CleanupFailure { get; internal set; }
 }
 
 public sealed class ScaleConfigurationException : Exception
@@ -46,7 +50,8 @@ public sealed class ScaleCompilationTimeoutException : ScaleCompilationException
         string outputPath,
         string standardOutput,
         string standardError,
-        Exception? innerException = null)
+        Exception? innerException = null,
+        Exception? cleanupFailure = null)
         : base(
             $"The SCALE compiler exceeded the {timeout} timeout.",
             sourcePath,
@@ -57,7 +62,26 @@ public sealed class ScaleCompilationTimeoutException : ScaleCompilationException
             innerException)
     {
         Timeout = timeout;
+        CleanupFailure = cleanupFailure;
     }
 
     public TimeSpan Timeout { get; }
+}
+
+public sealed class ScaleProcessCleanupException : Exception
+{
+    public ScaleProcessCleanupException(
+        string message,
+        int processGroupId,
+        string? wslDistribution,
+        Exception? innerException = null)
+        : base(message, innerException)
+    {
+        ProcessGroupId = processGroupId;
+        WslDistribution = wslDistribution;
+    }
+
+    public int ProcessGroupId { get; }
+
+    public string? WslDistribution { get; }
 }
