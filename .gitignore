@@ -1,5 +1,5 @@
 /docs/internal/
-/bin/
-/obj/
-/TestResults/
+**/bin/
+**/obj/
+**/TestResults/
 *.csproj.user
