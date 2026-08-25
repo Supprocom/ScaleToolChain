@@ -25,10 +25,10 @@ if (args.Contains("--child", StringComparer.Ordinal))
 Console.WriteLine("fake standard output");
 Console.Error.WriteLine("fake standard error");
 
-var outputPath = FindOutputPath(args);
+var outputPaths = FindOutputPaths(args);
 if (mode.Equals("fail", StringComparison.Ordinal))
 {
-    if (outputPath is not null)
+    foreach (var outputPath in outputPaths)
     {
         await File.WriteAllTextAsync(outputPath, "partial output", Encoding.UTF8);
     }
@@ -56,24 +56,33 @@ if (mode.Equals("sleep", StringComparison.Ordinal))
     return 0;
 }
 
-if (outputPath is null)
+if (mode.Equals("no-output", StringComparison.Ordinal))
+{
+    return 0;
+}
+
+if (outputPaths.Count == 0)
 {
     Console.Error.WriteLine("The fake compiler did not receive -o.");
     return 2;
 }
 
-await File.WriteAllTextAsync(outputPath, "deterministic fake output", Encoding.UTF8);
+foreach (var outputPath in outputPaths)
+{
+    await File.WriteAllTextAsync(outputPath, "deterministic fake output", Encoding.UTF8);
+}
 return 0;
 
-static string? FindOutputPath(IReadOnlyList<string> arguments)
+static IReadOnlyList<string> FindOutputPaths(IReadOnlyList<string> arguments)
 {
+    var outputPaths = new List<string>();
     for (var index = 0; index < arguments.Count - 1; index++)
     {
         if (arguments[index].Equals("-o", StringComparison.Ordinal))
         {
-            return arguments[index + 1];
+            outputPaths.Add(arguments[index + 1]);
         }
     }
 
-    return null;
+    return outputPaths;
 }

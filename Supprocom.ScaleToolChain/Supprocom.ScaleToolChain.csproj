@@ -4,10 +4,10 @@
     <AssemblyName>Supprocom.ScaleToolChain</AssemblyName>
     <RootNamespace>Supprocom.ScaleToolChain</RootNamespace>
     <PackageId>Supprocom.ScaleToolChain</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.1.1</Version>
     <Authors>Supprocom</Authors>
     <Company>Supprocom</Company>
-    <Description>Invoke the installed SCALE compiler for explicit AMD or NVIDIA targets.</Description>
+    <Description>Invoke installed SCALE tools with explicit targets and argument vectors.</Description>
     <PackageTags>CUDA;SCALE;AMD;NVIDIA;compiler</PackageTags>
     <PackageLicenseExpression>AGPL-3.0-only</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/Supprocom/ScaleToolChain</PackageProjectUrl>

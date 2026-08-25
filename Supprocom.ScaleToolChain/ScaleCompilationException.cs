@@ -46,8 +46,8 @@ public sealed class ScaleCompilationTimeoutException : ScaleCompilationException
 {
     public ScaleCompilationTimeoutException(
         TimeSpan timeout,
-        string sourcePath,
-        string outputPath,
+        string? sourcePath,
+        string? outputPath,
         string standardOutput,
         string standardError,
         Exception? innerException = null,

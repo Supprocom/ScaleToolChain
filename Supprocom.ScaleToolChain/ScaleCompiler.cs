@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Security.Cryptography;
 
@@ -6,21 +7,71 @@ namespace Supprocom.ScaleToolChain;
 
 public static class ScaleCompiler
 {
+    public static async Task<ScaleInvocationResult> InvokeAsync(
+        ScaleInvocationRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var validated = ValidateInvocation(request);
+        var invocation = ScaleCommandBuilder.Build(validated.Request, validated.WorkingDirectory);
+        return await ExecuteAsync(validated, invocation, cancellationToken).ConfigureAwait(false);
+    }
+
     public static async Task<ScaleCompilationResult> CompileAsync(
         ScaleCompilationRequest request,
         CancellationToken cancellationToken = default)
     {
-        var validated = Validate(request);
-        var sourceSha256 = await ComputeSha256Async(validated.SourcePath, cancellationToken).ConfigureAwait(false);
-        var invocation = ScaleCommandBuilder.Build(
-            validated.CompilerPath,
-            validated.Target,
-            validated.SourcePath,
-            validated.OutputPath,
-            validated.WorkingDirectory,
-            validated.Settings);
-        var start = Stopwatch.GetTimestamp();
+        var validatedCompilation = ValidateCompilation(request);
+        var sourceSha256 = await ComputeSha256Async(validatedCompilation.SourcePath, cancellationToken).ConfigureAwait(false);
+        var validated = ValidateInvocation(validatedCompilation.InvocationRequest);
+        var invocation = ScaleCommandBuilder.Build(validated.Request, validated.WorkingDirectory);
+        var result = await ExecuteAsync(validated, invocation, cancellationToken, validatedCompilation.SourcePath).ConfigureAwait(false);
+        if (result.Succeeded &&
+            result.ProducedOutputPaths.Count == 1 &&
+            new FileInfo(result.ProducedOutputPaths[0]).Length == 0)
+        {
+            var cleanupFailure = DeleteFailedOutputs(result.ProducedOutputPaths);
+            var exception = new ScaleCompilationException(
+                "The SCALE compiler created an empty output.",
+                validatedCompilation.SourcePath,
+                validatedCompilation.OutputPath,
+                result.ExitCode,
+                result.StandardOutput,
+                result.StandardError)
+            {
+                CleanupFailure = cleanupFailure
+            };
+            throw exception;
+        }
 
+        return new ScaleCompilationResult
+        {
+            SourcePath = validatedCompilation.SourcePath,
+            OutputPath = validatedCompilation.OutputPath,
+            Target = validatedCompilation.Target,
+            ProcessPath = result.ProcessPath,
+            Arguments = result.Arguments,
+            ProcessArguments = result.ProcessArguments,
+            ExitCode = result.ExitCode,
+            Succeeded = result.Succeeded,
+            StandardOutput = result.StandardOutput,
+            StandardError = result.StandardError,
+            SourceSha256 = sourceSha256,
+            OutputSha256 = result.OutputSha256.TryGetValue(validatedCompilation.OutputPath, out var outputSha256)
+                ? outputSha256
+                : null,
+            ProducedOutputPaths = result.ProducedOutputPaths,
+            CleanupFailure = result.CleanupFailure,
+            Duration = result.Duration
+        };
+    }
+
+    private static async Task<ScaleInvocationResult> ExecuteAsync(
+        ValidatedInvocation validated,
+        ScaleProcessInvocation invocation,
+        CancellationToken cancellationToken,
+        string? sourcePath = null)
+    {
+        var start = Stopwatch.GetTimestamp();
         var startInfo = new ProcessStartInfo
         {
             FileName = invocation.ProcessPath,
@@ -55,9 +106,8 @@ public static class ScaleCompiler
             if (!process.Start())
             {
                 throw new ScaleCompilationException(
-                    "The SCALE compiler process did not start.",
-                    validated.SourcePath,
-                    validated.OutputPath);
+                    "The SCALE process did not start.",
+                    outputPath: FirstOutput(validated.OutputPaths));
             }
         }
         catch (ScaleCompilationException)
@@ -67,16 +117,15 @@ public static class ScaleCompiler
         catch (Exception exception) when (exception is InvalidOperationException or Win32Exception)
         {
             throw new ScaleCompilationException(
-                $"The SCALE compiler process could not start: {exception.Message}",
-                validated.SourcePath,
-                validated.OutputPath,
+                $"The SCALE process could not start: {exception.Message}",
+                outputPath: FirstOutput(validated.OutputPaths),
                 innerException: exception);
         }
 
         var standardOutputTask = ReadStandardOutputAsync(process.StandardOutput, invocation, linuxPidSource);
         var standardErrorTask = process.StandardError.ReadToEndAsync(CancellationToken.None);
         using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeoutSource.CancelAfter(validated.Settings.Timeout);
+        timeoutSource.CancelAfter(validated.Request.Timeout);
 
         try
         {
@@ -84,13 +133,14 @@ public static class ScaleCompiler
         }
         catch (OperationCanceledException exception) when (!cancellationToken.IsCancellationRequested)
         {
-            var cleanupFailure = await StopProcessAsync(process, invocation, linuxPidSource).ConfigureAwait(false);
+            var processCleanupFailure = await StopProcessAsync(process, invocation, linuxPidSource).ConfigureAwait(false);
             var diagnostics = await ReadDiagnosticsAsync(standardOutputTask, standardErrorTask, TimeSpan.FromSeconds(2)).ConfigureAwait(false);
-            DeleteFailedOutput(validated.OutputPath);
+            var outputCleanupFailure = DeleteFailedOutputs(validated.OutputPaths);
+            var cleanupFailure = CombineCleanupFailures(processCleanupFailure, outputCleanupFailure);
             throw new ScaleCompilationTimeoutException(
-                validated.Settings.Timeout,
-                validated.SourcePath,
-                validated.OutputPath,
+                validated.Request.Timeout,
+                sourcePath,
+                outputPath: FirstOutput(validated.OutputPaths),
                 diagnostics.StandardOutput,
                 diagnostics.StandardError,
                 exception,
@@ -98,9 +148,10 @@ public static class ScaleCompiler
         }
         catch (OperationCanceledException exception)
         {
-            var cleanupFailure = await StopProcessAsync(process, invocation, linuxPidSource).ConfigureAwait(false);
+            var processCleanupFailure = await StopProcessAsync(process, invocation, linuxPidSource).ConfigureAwait(false);
             await ReadDiagnosticsAsync(standardOutputTask, standardErrorTask, TimeSpan.FromSeconds(2)).ConfigureAwait(false);
-            DeleteFailedOutput(validated.OutputPath);
+            var outputCleanupFailure = DeleteFailedOutputs(validated.OutputPaths);
+            var cleanupFailure = CombineCleanupFailures(processCleanupFailure, outputCleanupFailure);
             if (cleanupFailure is not null)
             {
                 exception.Data[ScaleCompilationException.CleanupFailureDataKey] = cleanupFailure;
@@ -111,55 +162,85 @@ public static class ScaleCompiler
 
         var completedDiagnostics = await ReadDiagnosticsAsync(standardOutputTask, standardErrorTask).ConfigureAwait(false);
         var duration = Stopwatch.GetElapsedTime(start);
-        var result = new ScaleCompilationResult
+        var producedOutputPaths = validated.OutputPaths.Where(File.Exists).ToArray();
+        var outputHashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var outputPath in producedOutputPaths)
         {
-            SourcePath = validated.SourcePath,
-            OutputPath = validated.OutputPath,
-            Target = validated.Target,
-            ProcessPath = invocation.ProcessPath,
-            Arguments = invocation.Arguments,
-            ExitCode = process.ExitCode,
-            Succeeded = process.ExitCode == 0,
-            StandardOutput = completedDiagnostics.StandardOutput,
-            StandardError = completedDiagnostics.StandardError,
-            SourceSha256 = sourceSha256,
-            Duration = duration
-        };
+            outputHashes[outputPath] = await ComputeSha256Async(outputPath, CancellationToken.None).ConfigureAwait(false);
+        }
 
         if (process.ExitCode != 0)
         {
-            DeleteFailedOutput(validated.OutputPath);
-            return result;
-        }
-
-        if (!File.Exists(validated.OutputPath))
-        {
-            throw new ScaleCompilationException(
-                "The SCALE compiler exited successfully but did not create the requested output.",
-                validated.SourcePath,
-                validated.OutputPath,
+            var outputCleanupFailure = DeleteFailedOutputs(validated.OutputPaths);
+            return CreateResult(
+                validated,
+                invocation,
                 process.ExitCode,
-                completedDiagnostics.StandardOutput,
-                completedDiagnostics.StandardError);
+                completedDiagnostics,
+                duration,
+                Array.Empty<string>(),
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+                outputCleanupFailure);
         }
 
-        var outputInfo = new FileInfo(validated.OutputPath);
-        if (outputInfo.Length == 0)
+        var missingOutputPaths = validated.OutputPaths.Where(static path => !File.Exists(path)).ToArray();
+        if (missingOutputPaths.Length > 0)
         {
-            DeleteFailedOutput(validated.OutputPath);
-            throw new ScaleCompilationException(
-                "The SCALE compiler created an empty output.",
-                validated.SourcePath,
-                validated.OutputPath,
-                process.ExitCode,
-                completedDiagnostics.StandardOutput,
-                completedDiagnostics.StandardError);
+            var outputCleanupFailure = DeleteFailedOutputs(validated.OutputPaths);
+            var exception = new ScaleCompilationException(
+                $"The SCALE process exited successfully but did not create the declared output '{missingOutputPaths[0]}'.",
+                outputPath: missingOutputPaths[0],
+                exitCode: process.ExitCode,
+                standardOutput: completedDiagnostics.StandardOutput,
+                standardError: completedDiagnostics.StandardError)
+            {
+                CleanupFailure = outputCleanupFailure
+            };
+            throw exception;
         }
 
-        return result with { OutputSha256 = await ComputeSha256Async(validated.OutputPath, cancellationToken).ConfigureAwait(false) };
+        return CreateResult(
+            validated,
+            invocation,
+            process.ExitCode,
+            completedDiagnostics,
+            duration,
+            producedOutputPaths,
+            outputHashes,
+            cleanupFailure: null);
     }
 
-    private static ValidatedRequest Validate(ScaleCompilationRequest request)
+    private static ScaleInvocationResult CreateResult(
+        ValidatedInvocation validated,
+        ScaleProcessInvocation invocation,
+        int exitCode,
+        Diagnostics diagnostics,
+        TimeSpan duration,
+        IReadOnlyList<string> producedOutputPaths,
+        IReadOnlyDictionary<string, string> outputHashes,
+        Exception? cleanupFailure)
+    {
+        return new ScaleInvocationResult
+        {
+            ToolPath = invocation.ToolPath,
+            ExecutedToolPath = invocation.ExecutedToolPath,
+            ProcessPath = invocation.ProcessPath,
+            Arguments = invocation.ToolArguments,
+            ProcessArguments = invocation.Arguments,
+            Target = validated.Request.Target,
+            ExecutionMode = validated.Request.ExecutionMode,
+            ExitCode = exitCode,
+            Succeeded = exitCode == 0,
+            StandardOutput = diagnostics.StandardOutput,
+            StandardError = diagnostics.StandardError,
+            ProducedOutputPaths = producedOutputPaths,
+            OutputSha256 = outputHashes,
+            CleanupFailure = cleanupFailure,
+            Duration = duration
+        };
+    }
+
+    private static ValidatedCompilation ValidateCompilation(ScaleCompilationRequest request)
     {
         if (request is null)
         {
@@ -171,29 +252,14 @@ public static class ScaleCompiler
             throw new ScaleConfigurationException("Compilation settings are required.");
         }
 
-        if (string.IsNullOrWhiteSpace(request.SourcePath))
+        if (request.Settings.Target is null)
         {
-            throw new ScaleConfigurationException("A CUDA source path is required.");
-        }
-
-        if (string.IsNullOrWhiteSpace(request.OutputPath))
-        {
-            throw new ScaleConfigurationException("An output path is required.");
+            throw new ScaleConfigurationException("An explicit SCALE GPU target is required.");
         }
 
         if (string.IsNullOrWhiteSpace(request.Settings.CompilerPath))
         {
             throw new ScaleConfigurationException("An absolute SCALE compiler path is required.");
-        }
-
-        if (request.Settings.CompilerPath.Contains('\0'))
-        {
-            throw new ScaleConfigurationException("The SCALE compiler path must not contain a null character.");
-        }
-
-        if (request.Settings.Target is null)
-        {
-            throw new ScaleConfigurationException("An explicit SCALE GPU target is required.");
         }
 
         if (!Enum.IsDefined(request.Settings.ExecutionMode))
@@ -203,32 +269,24 @@ public static class ScaleCompiler
 
         if (request.Settings.Timeout <= TimeSpan.Zero || request.Settings.Timeout > TimeSpan.FromHours(24))
         {
-            throw new ScaleConfigurationException("The compiler timeout must be greater than zero and no longer than 24 hours.");
+            throw new ScaleConfigurationException("The SCALE timeout must be greater than zero and no longer than 24 hours.");
         }
 
-        ValidateEnvironment(request.Settings.Environment);
-        var cudaToolkitPath = ValidateToolchainPath(
-            request.Settings.CudaToolkitPath,
-            request.Settings.ExecutionMode,
-            "CUDA toolkit path");
-        var includePaths = ValidateIncludePaths(request.Settings.IncludePaths, request.Settings.ExecutionMode);
-        ValidateDefinitions(request.Settings.Definitions);
+        if (request.Settings.IncludePaths is null || request.Settings.Definitions is null)
+        {
+            throw new ScaleConfigurationException("Compiler include paths and definitions cannot be null.");
+        }
+
+        ValidateCompilationEnvironment(request.Settings.Environment);
 
         var sourcePath = RequireAbsolutePath(request.SourcePath, "The CUDA source path must be absolute.");
         var outputPath = RequireAbsolutePath(request.OutputPath, "The output path must be absolute.");
-        if (request.Settings.ExecutionMode == ScaleExecutionMode.Wsl &&
-            (!IsWindowsDriveAbsolutePath(sourcePath) || !IsWindowsDriveAbsolutePath(outputPath)))
-        {
-            throw new ScaleConfigurationException("WSL execution requires absolute Windows source and output paths.");
-        }
-
         if (!File.Exists(sourcePath))
         {
             throw new ScaleConfigurationException($"The CUDA source file does not exist: {sourcePath}");
         }
 
-        var sourceInfo = new FileInfo(sourcePath);
-        if (sourceInfo.Length == 0)
+        if (new FileInfo(sourcePath).Length == 0)
         {
             throw new ScaleConfigurationException("The CUDA source file must not be empty.");
         }
@@ -238,21 +296,95 @@ public static class ScaleCompiler
             throw new ScaleConfigurationException("The output path must differ from the CUDA source path.");
         }
 
-        if (File.Exists(outputPath))
-        {
-            throw new ScaleConfigurationException($"The output file already exists: {outputPath}");
-        }
-
-        var outputDirectory = Path.GetDirectoryName(outputPath);
-        if (string.IsNullOrEmpty(outputDirectory) || !Directory.Exists(outputDirectory))
-        {
-            throw new ScaleConfigurationException($"The output directory does not exist: {outputDirectory ?? outputPath}");
-        }
-
+        EnsureOutputPath(outputPath, request.Settings.ExecutionMode);
         var workingDirectory = request.Settings.WorkingDirectory is null
             ? Path.GetDirectoryName(sourcePath)!
             : RequireAbsolutePath(request.Settings.WorkingDirectory, "The working directory must be absolute.");
-        if (request.Settings.ExecutionMode == ScaleExecutionMode.Wsl && !IsWindowsDriveAbsolutePath(workingDirectory))
+        if (!Directory.Exists(workingDirectory))
+        {
+            throw new ScaleConfigurationException($"The working directory does not exist: {workingDirectory}");
+        }
+
+        var invocationRequest = ScaleCommandBuilder.CreateCompilationRequest(
+            request.Settings.CompilerPath,
+            request.Settings.Target,
+            sourcePath,
+            outputPath,
+            workingDirectory,
+            request.Settings);
+        return new ValidatedCompilation(sourcePath, outputPath, request.Settings.Target, invocationRequest);
+    }
+
+    private static ValidatedInvocation ValidateInvocation(ScaleInvocationRequest request)
+    {
+        if (request is null)
+        {
+            throw new ScaleConfigurationException("An invocation request is required.");
+        }
+
+        if (!Enum.IsDefined(request.ToolKind) || !Enum.IsDefined(request.TargetArgumentMode) || !Enum.IsDefined(request.ExecutionMode))
+        {
+            throw new ScaleConfigurationException("The SCALE invocation mode is not supported.");
+        }
+
+        if (request.Arguments is null)
+        {
+            throw new ScaleConfigurationException("The SCALE argument collection cannot be null.");
+        }
+
+        var arguments = request.Arguments.ToArray();
+        if (arguments.Any(static argument => argument is null || argument.Contains('\0')))
+        {
+            throw new ScaleConfigurationException("SCALE arguments must not contain null characters.");
+        }
+
+        if (request.PathArgumentIndexes is null)
+        {
+            throw new ScaleConfigurationException("The path argument index collection cannot be null.");
+        }
+
+        var indexes = request.PathArgumentIndexes.ToArray();
+        if (indexes.Any(index => index < 0 || index >= arguments.Length) || indexes.Distinct().Count() != indexes.Length)
+        {
+            throw new ScaleConfigurationException("SCALE path argument indexes must identify unique argument positions.");
+        }
+
+        if (request.Environment is null)
+        {
+            throw new ScaleConfigurationException("The SCALE environment collection cannot be null.");
+        }
+
+        foreach (var pair in request.Environment)
+        {
+            if (!IsValidEnvironmentName(pair.Key) || pair.Value is null || pair.Value.Contains('\0') ||
+                request.ToolKind == ScaleInvocationToolKind.Compiler &&
+                !request.AllowPackageEnvironmentOverrides &&
+                IsReservedCompilerEnvironment(pair.Key))
+            {
+                throw new ScaleConfigurationException($"The SCALE environment entry '{pair.Key}' is not valid.");
+            }
+        }
+
+        if (request.Timeout <= TimeSpan.Zero || request.Timeout > TimeSpan.FromHours(24))
+        {
+            throw new ScaleConfigurationException("The SCALE timeout must be greater than zero and no longer than 24 hours.");
+        }
+
+        if (request.ToolKind == ScaleInvocationToolKind.Compiler && request.TargetArgumentMode != ScaleTargetArgumentMode.None && request.Target is null)
+        {
+            throw new ScaleConfigurationException("An explicit SCALE GPU target is required for the selected target argument mode.");
+        }
+
+        if (request.ToolKind == ScaleInvocationToolKind.Utility && request.TargetArgumentMode != ScaleTargetArgumentMode.None)
+        {
+            throw new ScaleConfigurationException("Utility invocations must use the None target argument mode.");
+        }
+
+        var toolPath = ValidateToolPath(request);
+        var workingDirectory = request.WorkingDirectory is null
+            ? RequireAbsolutePath(Environment.CurrentDirectory, "The working directory must be absolute.")
+            : RequireAbsolutePath(request.WorkingDirectory, "The working directory must be absolute.");
+        if (request.ExecutionMode == ScaleExecutionMode.Wsl && !IsWindowsDriveAbsolutePath(workingDirectory))
         {
             throw new ScaleConfigurationException("WSL execution requires an absolute Windows working directory.");
         }
@@ -262,89 +394,33 @@ public static class ScaleCompiler
             throw new ScaleConfigurationException($"The working directory does not exist: {workingDirectory}");
         }
 
-        var compilerPath = ValidateCompilerPath(request.Settings);
-        var settings = request.Settings with
+        var outputPaths = ValidateOutputPaths(request.OutputPaths, request.ExecutionMode);
+        foreach (var index in indexes)
         {
-            CompilerPath = compilerPath,
+            if (request.ExecutionMode == ScaleExecutionMode.Wsl)
+            {
+                ValidateWslPathArgument(arguments[index]);
+            }
+        }
+
+        if (request.ExecutionMode == ScaleExecutionMode.Wsl)
+        {
+            ValidateWslSettings(request);
+        }
+
+        var normalizedRequest = request with
+        {
+            ToolPath = toolPath,
+            Arguments = Array.AsReadOnly(arguments),
+            PathArgumentIndexes = Array.AsReadOnly(indexes),
+            OutputPaths = outputPaths,
             WorkingDirectory = workingDirectory,
-            CudaToolkitPath = cudaToolkitPath,
-            IncludePaths = includePaths
+            Environment = new Dictionary<string, string>(request.Environment, StringComparer.Ordinal)
         };
-
-        return new ValidatedRequest(sourcePath, outputPath, compilerPath, request.Settings.Target, workingDirectory, settings);
+        return new ValidatedInvocation(normalizedRequest, workingDirectory, outputPaths);
     }
 
-    private static string ValidateCompilerPath(ScaleCompilationSettings settings)
-    {
-        if (settings.ExecutionMode == ScaleExecutionMode.Wsl)
-        {
-            if (!OperatingSystem.IsWindows())
-            {
-                throw new ScaleConfigurationException("WSL execution requires a Windows host.");
-            }
-
-            if (string.IsNullOrWhiteSpace(settings.WslDistribution))
-            {
-                throw new ScaleConfigurationException("A WSL distribution is required for WSL execution.");
-            }
-
-            if (settings.WslDistribution.Contains('\0'))
-            {
-                throw new ScaleConfigurationException("The WSL distribution must not contain a null character.");
-            }
-
-            if (string.IsNullOrWhiteSpace(settings.WslExecutablePath))
-            {
-                throw new ScaleConfigurationException("The WSL executable path is required.");
-            }
-
-            if (settings.WslExecutablePath.Contains('\0'))
-            {
-                throw new ScaleConfigurationException("The WSL executable path must not contain a null character.");
-            }
-
-            if (!string.Equals(settings.WslExecutablePath, "wsl.exe", StringComparison.OrdinalIgnoreCase))
-            {
-                var wslExecutablePath = RequireAbsolutePath(
-                    settings.WslExecutablePath,
-                    "The WSL executable path must be absolute when it is not wsl.exe.");
-                if (!File.Exists(wslExecutablePath))
-                {
-                    throw new ScaleConfigurationException($"The WSL executable does not exist: {wslExecutablePath}");
-                }
-            }
-
-            if (ScaleCommandBuilder.ToWslCompilerPath(settings.CompilerPath) == settings.CompilerPath)
-            {
-                return settings.CompilerPath;
-            }
-
-            var windowsCompilerPath = RequireAbsolutePath(
-                settings.CompilerPath,
-                "The SCALE compiler path must be absolute.");
-            if (!IsWindowsDriveAbsolutePath(windowsCompilerPath))
-            {
-                throw new ScaleConfigurationException("The WSL compiler path must be an absolute POSIX or Windows path.");
-            }
-
-            if (!File.Exists(windowsCompilerPath))
-            {
-                throw new ScaleConfigurationException($"The SCALE compiler does not exist: {windowsCompilerPath}");
-            }
-
-            return windowsCompilerPath;
-        }
-
-        var compilerPath = RequireAbsolutePath(settings.CompilerPath, "The SCALE compiler path must be absolute.");
-        if (!File.Exists(compilerPath))
-        {
-            throw new ScaleConfigurationException($"The SCALE compiler does not exist: {compilerPath}");
-        }
-
-        return compilerPath;
-    }
-
-    private static void ValidateEnvironment(IReadOnlyDictionary<string, string> environment)
+    private static void ValidateCompilationEnvironment(IReadOnlyDictionary<string, string> environment)
     {
         if (environment is null)
         {
@@ -353,10 +429,112 @@ public static class ScaleCompiler
 
         foreach (var pair in environment)
         {
-            if (!IsValidEnvironmentName(pair.Key) || IsReservedCompilerEnvironment(pair.Key) || pair.Value is null || pair.Value.Contains('\0'))
+            if (!IsValidEnvironmentName(pair.Key) || pair.Value is null || pair.Value.Contains('\0') || IsReservedCompilerEnvironment(pair.Key))
             {
                 throw new ScaleConfigurationException($"The compiler environment entry '{pair.Key}' is not valid.");
             }
+        }
+    }
+
+    private static string ValidateToolPath(ScaleInvocationRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.ToolPath) || request.ToolPath.Contains('\0'))
+        {
+            throw new ScaleConfigurationException("An absolute SCALE tool path is required.");
+        }
+
+        if (request.ExecutionMode == ScaleExecutionMode.Wsl && IsPosixAbsolutePath(request.ToolPath))
+        {
+            return request.ToolPath;
+        }
+
+        var absolutePath = RequireAbsolutePath(request.ToolPath, "The SCALE tool path must be absolute.");
+        if (!File.Exists(absolutePath))
+        {
+            throw new ScaleConfigurationException($"The SCALE tool does not exist: {absolutePath}");
+        }
+
+        return absolutePath;
+    }
+
+    private static void ValidateWslSettings(ScaleInvocationRequest request)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            throw new ScaleConfigurationException("WSL execution requires a Windows host.");
+        }
+
+        if (string.IsNullOrWhiteSpace(request.WslDistribution) || request.WslDistribution.Contains('\0'))
+        {
+            throw new ScaleConfigurationException("A WSL distribution is required for WSL execution.");
+        }
+
+        if (string.IsNullOrWhiteSpace(request.WslExecutablePath) || request.WslExecutablePath.Contains('\0'))
+        {
+            throw new ScaleConfigurationException("The WSL executable path is required.");
+        }
+
+        if (!string.Equals(request.WslExecutablePath, "wsl.exe", StringComparison.OrdinalIgnoreCase))
+        {
+            var executablePath = RequireAbsolutePath(request.WslExecutablePath, "The WSL executable path must be absolute.");
+            if (!File.Exists(executablePath))
+            {
+                throw new ScaleConfigurationException($"The WSL executable does not exist: {executablePath}");
+            }
+        }
+    }
+
+    private static ReadOnlyCollection<string> ValidateOutputPaths(
+        IReadOnlyList<string> outputPaths,
+        ScaleExecutionMode executionMode)
+    {
+        if (outputPaths is null)
+        {
+            throw new ScaleConfigurationException("The output path collection cannot be null.");
+        }
+
+        var comparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+        var normalized = new List<string>(outputPaths.Count);
+        foreach (var outputPath in outputPaths)
+        {
+            var absolutePath = RequireAbsolutePath(outputPath, "Each output path must be absolute.");
+            EnsureOutputPath(absolutePath, executionMode);
+            if (File.Exists(absolutePath))
+            {
+                throw new ScaleConfigurationException($"The output file already exists: {absolutePath}");
+            }
+
+            if (normalized.Contains(absolutePath, comparer))
+            {
+                throw new ScaleConfigurationException($"The output path is listed more than once: {absolutePath}");
+            }
+
+            normalized.Add(absolutePath);
+        }
+
+        return Array.AsReadOnly(normalized.ToArray());
+    }
+
+    private static void EnsureOutputPath(string outputPath, ScaleExecutionMode executionMode)
+    {
+        if (executionMode == ScaleExecutionMode.Wsl && !IsWindowsDriveAbsolutePath(outputPath))
+        {
+            throw new ScaleConfigurationException("WSL output paths must be absolute Windows paths.");
+        }
+
+        var outputDirectory = Path.GetDirectoryName(outputPath);
+        if (string.IsNullOrEmpty(outputDirectory) || !Directory.Exists(outputDirectory))
+        {
+            throw new ScaleConfigurationException($"The output directory does not exist: {outputDirectory ?? outputPath}");
+        }
+    }
+
+    private static void ValidateWslPathArgument(string argument)
+    {
+        var path = argument.StartsWith('@') ? argument[1..] : argument;
+        if (!IsPosixAbsolutePath(path) && !IsWindowsDriveAbsolutePath(path))
+        {
+            throw new ScaleConfigurationException("WSL path arguments must be absolute Windows or POSIX paths.");
         }
     }
 
@@ -365,74 +543,6 @@ public static class ScaleCompiler
         "CUDA_CXX" or "CUDACXX" or "CUDA_NVCC_EXECUTABLE" or "CUCC" or "NVCC_PREPEND_FLAGS" or "NVCC_APPEND_FLAGS" => true,
         _ => false
     };
-
-    private static string? ValidateToolchainPath(
-        string? path,
-        ScaleExecutionMode executionMode,
-        string settingName)
-    {
-        if (path is null)
-        {
-            return null;
-        }
-
-        if (string.IsNullOrWhiteSpace(path) || path.Contains('\0'))
-        {
-            throw new ScaleConfigurationException($"The {settingName} must be an absolute path.");
-        }
-
-        if (executionMode == ScaleExecutionMode.Wsl && IsPosixAbsolutePath(path))
-        {
-            return path;
-        }
-
-        var absolutePath = RequireAbsolutePath(path, $"The {settingName} must be an absolute path.");
-        if (executionMode == ScaleExecutionMode.Wsl && !IsWindowsDriveAbsolutePath(absolutePath))
-        {
-            throw new ScaleConfigurationException($"The {settingName} must be an absolute POSIX or Windows path for WSL execution.");
-        }
-
-        if (!Directory.Exists(absolutePath))
-        {
-            throw new ScaleConfigurationException($"The {settingName} does not exist: {absolutePath}");
-        }
-
-        return absolutePath;
-    }
-
-    private static System.Collections.ObjectModel.ReadOnlyCollection<string> ValidateIncludePaths(
-        IReadOnlyList<string> includePaths,
-        ScaleExecutionMode executionMode)
-    {
-        if (includePaths is null)
-        {
-            throw new ScaleConfigurationException("The include path collection cannot be null.");
-        }
-
-        var normalized = new List<string>(includePaths.Count);
-        foreach (var includePath in includePaths)
-        {
-            normalized.Add(ValidateToolchainPath(includePath, executionMode, "include path")!);
-        }
-
-        return Array.AsReadOnly(normalized.ToArray());
-    }
-
-    private static void ValidateDefinitions(IReadOnlyDictionary<string, string> definitions)
-    {
-        if (definitions is null)
-        {
-            throw new ScaleConfigurationException("The definition collection cannot be null.");
-        }
-
-        foreach (var definition in definitions)
-        {
-            if (!IsValidEnvironmentName(definition.Key) || definition.Value is null || definition.Value.Contains('\0'))
-            {
-                throw new ScaleConfigurationException($"The definition '{definition.Key}' is not valid.");
-            }
-        }
-    }
 
     private static bool IsValidEnvironmentName(string name)
     {
@@ -446,12 +556,13 @@ public static class ScaleCompiler
 
     private static string RequireAbsolutePath(string path, string message)
     {
-        if (path.Contains('\0') || !Path.IsPathFullyQualified(path))
+        if (string.IsNullOrWhiteSpace(path) || path.Contains('\0') ||
+            (!Path.IsPathFullyQualified(path) && !IsPosixAbsolutePath(path)))
         {
             throw new ScaleConfigurationException(message);
         }
 
-        return Path.GetFullPath(path);
+        return IsPosixAbsolutePath(path) ? path : Path.GetFullPath(path);
     }
 
     private static bool IsWindowsDriveAbsolutePath(string path) =>
@@ -568,35 +679,20 @@ public static class ScaleCompiler
 
     private static async Task<int> WaitForLinuxPidAsync(TaskCompletionSource<int> linuxPidSource)
     {
-        var completed = await Task.WhenAny(
-            linuxPidSource.Task,
-            Task.Delay(TimeSpan.FromMilliseconds(500))).ConfigureAwait(false);
+        var completed = await Task.WhenAny(linuxPidSource.Task, Task.Delay(TimeSpan.FromMilliseconds(500))).ConfigureAwait(false);
         return completed == linuxPidSource.Task ? await linuxPidSource.Task.ConfigureAwait(false) : 0;
     }
 
-    private static async Task<WslControlResult> SendWslSignalAsync(
+    private static Task<WslControlResult> SendWslSignalAsync(
         ScaleProcessInvocation invocation,
         int linuxPid,
-        string signal)
-    {
-        return await RunWslControlAsync(
-            invocation,
-            "/bin/kill",
-            signal,
-            "--",
-            $"-{linuxPid}").ConfigureAwait(false);
-    }
+        string signal) => RunWslControlAsync(invocation, "/bin/kill", signal, "--", $"-{linuxPid}");
 
     private static async Task<WslProcessGroupState> ProbeWslProcessGroupAsync(
         ScaleProcessInvocation invocation,
         int linuxPid)
     {
-        var result = await RunWslControlAsync(
-            invocation,
-            "/bin/kill",
-            "-0",
-            "--",
-            $"-{linuxPid}").ConfigureAwait(false);
+        var result = await RunWslControlAsync(invocation, "/bin/kill", "-0", "--", $"-{linuxPid}").ConfigureAwait(false);
         if (!result.Started || result.TimedOut)
         {
             return WslProcessGroupState.Unknown;
@@ -683,15 +779,6 @@ public static class ScaleCompiler
         }
     }
 
-    private enum WslProcessGroupState
-    {
-        Present,
-        Absent,
-        Unknown
-    }
-
-    private readonly record struct WslControlResult(bool Started, bool TimedOut, int ExitCode);
-
     private static async Task<bool> WaitForExitBoundedAsync(Process process, TimeSpan timeout)
     {
         try
@@ -735,30 +822,72 @@ public static class ScaleCompiler
         }
     }
 
-    private static void DeleteFailedOutput(string outputPath)
+    private static ScaleOutputCleanupException? DeleteFailedOutputs(IReadOnlyList<string> outputPaths)
     {
-        try
+        var failedPaths = new List<string>();
+        foreach (var outputPath in outputPaths)
         {
-            if (File.Exists(outputPath))
+            try
             {
-                File.Delete(outputPath);
+                if (File.Exists(outputPath))
+                {
+                    File.Delete(outputPath);
+                }
+            }
+            catch (IOException)
+            {
+                failedPaths.Add(outputPath);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                failedPaths.Add(outputPath);
             }
         }
-        catch (IOException)
-        {
-        }
-        catch (UnauthorizedAccessException)
-        {
-        }
+
+        return failedPaths.Count == 0
+            ? null
+            : new ScaleOutputCleanupException(
+                "One or more declared SCALE outputs could not be removed.",
+                Array.AsReadOnly(failedPaths.ToArray()));
     }
 
-    private sealed record ValidatedRequest(
+    private static Exception? CombineCleanupFailures(Exception? first, Exception? second)
+    {
+        if (first is null)
+        {
+            return second;
+        }
+
+        if (second is null)
+        {
+            return first;
+        }
+
+        return new AggregateException(first, second);
+    }
+
+    private static string? FirstOutput(IReadOnlyList<string> outputPaths) =>
+        outputPaths.Count == 0 ? null : outputPaths[0];
+
+    private enum WslProcessGroupState
+    {
+        Present,
+        Absent,
+        Unknown
+    }
+
+    private readonly record struct WslControlResult(bool Started, bool TimedOut, int ExitCode);
+
+    private sealed record ValidatedInvocation(
+        ScaleInvocationRequest Request,
+        string WorkingDirectory,
+        IReadOnlyList<string> OutputPaths);
+
+    private sealed record ValidatedCompilation(
         string SourcePath,
         string OutputPath,
-        string CompilerPath,
         ScaleGpuTarget Target,
-        string WorkingDirectory,
-        ScaleCompilationSettings Settings);
+        ScaleInvocationRequest InvocationRequest);
 
     private sealed record Diagnostics(string StandardOutput, string StandardError);
 }

@@ -17,6 +17,8 @@ await File.WriteAllTextAsync(
 var passed = 0;
 await RunAsync("target validation", TargetValidationAsync);
 await RunAsync("command construction", CommandConstructionAsync);
+await RunAsync("raw invocation vector", RawInvocationVectorAsync);
+await RunAsync("utility invocation", UtilityInvocationAsync);
 await RunAsync("successful compilation", SuccessfulCompilationAsync);
 await RunAsync("failed compilation diagnostics", FailedCompilationAsync);
 await RunAsync("timeout process cleanup", TimeoutCleanupAsync);
@@ -90,7 +92,7 @@ Task CommandConstructionAsync()
         @"D:\Temp Folder\output.o",
         @"D:\Temp Folder",
         settings);
-    AssertEqual("--gpu-architecture=sm_86", nvidiaInvocation.Arguments[15]);
+    AssertEqual("--gpu-architecture=sm_86", nvidiaInvocation.ToolArguments[1]);
 
     var configuredSettings = settings with
     {
@@ -110,11 +112,97 @@ Task CommandConstructionAsync()
         @"D:\Temp Folder",
         configuredSettings);
     AssertSequence(
-        configuredInvocation.Arguments.Skip(13).ToArray(),
-        "/opt/scale/llvm/bin/nvcc", "--cuda-path=/usr/local/cuda-12.9", "-I", "/opt/include",
-        "-D", "ALPHA_DEFINE=1", "-D", "ZED_DEFINE=two words", "--require-scale", "--gpu-architecture=gfx1201",
-        "-c", "/mnt/d/Temp Folder/input.cu", "-o", "/mnt/d/Temp Folder/output.o");
+        configuredInvocation.ToolArguments,
+        "--require-scale", "--gpu-architecture=gfx1201", "--cuda-path=/usr/local/cuda-12.9", "-I", "/opt/include",
+        "-D", "ALPHA_DEFINE=1", "-D", "ZED_DEFINE=two words", "-c", "/mnt/d/Temp Folder/input.cu", "-o", "/mnt/d/Temp Folder/output.o");
     return Task.CompletedTask;
+}
+
+async Task RawInvocationVectorAsync()
+{
+    var includePath = Path.Combine(testRoot, "include");
+    Directory.CreateDirectory(includePath);
+    var responsePath = Path.Combine(testRoot, "compile.rsp");
+    await File.WriteAllTextAsync(responsePath, "--save-temps\n", Encoding.UTF8);
+    var outputOne = NewOutputPath("raw-one.custom");
+    var outputTwo = NewOutputPath("raw-two.any");
+    var rawArguments = new[]
+    {
+        "--custom-option", "two words", "-I", includePath, $"@{responsePath}",
+        "-o", outputOne, "-o", outputTwo
+    };
+    var result = await ScaleCompiler.InvokeAsync(new ScaleInvocationRequest
+    {
+        ToolPath = fakeCompilerPath,
+        Arguments = rawArguments,
+        Target = ScaleGpuTarget.Amd("gfx1201"),
+        PathArgumentIndexes = new List<int> { 3, 4, 6, 8 },
+        OutputPaths = new[] { outputOne, outputTwo },
+        Environment = new Dictionary<string, string>
+        {
+            ["FAKE_SCALE_MODE"] = "success"
+        }
+    });
+    Assert(result.Succeeded, "The raw invocation must succeed.");
+    AssertEqual(0, result.ExitCode);
+    AssertEqual(fakeCompilerPath, result.ToolPath);
+    AssertSequence(result.Arguments, "--require-scale", "--gpu-architecture=gfx1201", rawArguments[0], rawArguments[1], rawArguments[2], rawArguments[3], rawArguments[4], rawArguments[5], rawArguments[6], rawArguments[7], rawArguments[8]);
+    AssertEqual(2, result.ProducedOutputPaths.Count);
+    Assert(File.Exists(outputOne), "The first arbitrary output must exist.");
+    Assert(File.Exists(outputTwo), "The second arbitrary output must exist.");
+    AssertEqual(2, result.OutputSha256.Count);
+
+    var callerTargetOutput = NewOutputPath("caller-target.any");
+    var callerTargetResult = await ScaleCompiler.InvokeAsync(new ScaleInvocationRequest
+    {
+        ToolPath = fakeCompilerPath,
+        Arguments = new[] { "--offload-arch=gfx1201", "-o", callerTargetOutput },
+        Target = ScaleGpuTarget.Amd("gfx1201"),
+        TargetArgumentMode = ScaleTargetArgumentMode.CallerSupplied,
+        OutputPaths = new[] { callerTargetOutput },
+        Environment = new Dictionary<string, string>
+        {
+            ["FAKE_SCALE_MODE"] = "success"
+        }
+    });
+    Assert(callerTargetResult.Succeeded, "The caller-supplied target invocation must succeed.");
+    AssertEqual("--offload-arch=gfx1201", callerTargetResult.Arguments[1]);
+
+    var missingOutput = NewOutputPath("missing-output.any");
+    var missingException = await AssertThrowsAsync<ScaleCompilationException>(() => ScaleCompiler.InvokeAsync(new ScaleInvocationRequest
+    {
+        ToolPath = fakeCompilerPath,
+        Arguments = new List<string> { "--version" },
+        TargetArgumentMode = ScaleTargetArgumentMode.None,
+        OutputPaths = new[] { missingOutput },
+        Environment = new Dictionary<string, string>
+        {
+            ["FAKE_SCALE_MODE"] = "no-output"
+        }
+    }));
+    AssertContains(missingException.Message, "declared output");
+    Assert(!File.Exists(missingOutput), "A missing declared output must remain absent.");
+}
+
+async Task UtilityInvocationAsync()
+{
+    var outputPath = NewOutputPath("utility-output.data");
+    var result = await ScaleCompiler.InvokeAsync(new ScaleInvocationRequest
+    {
+        ToolPath = fakeCompilerPath,
+        Arguments = new[] { "--utility-mode", "-o", outputPath },
+        ToolKind = ScaleInvocationToolKind.Utility,
+        TargetArgumentMode = ScaleTargetArgumentMode.None,
+        OutputPaths = new[] { outputPath },
+        Environment = new Dictionary<string, string>
+        {
+            ["FAKE_SCALE_MODE"] = "success"
+        }
+    });
+    Assert(result.Succeeded, "The utility invocation must succeed.");
+    Assert(result.Target is null, "A utility invocation must not report a compiler target.");
+    AssertSequence(result.Arguments, "--utility-mode", "-o", outputPath);
+    Assert(File.Exists(outputPath), "The utility output must exist.");
 }
 
 async Task SuccessfulCompilationAsync()
