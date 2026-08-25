@@ -22,9 +22,11 @@ await RunAsync("utility invocation", UtilityInvocationAsync);
 await RunAsync("successful compilation", SuccessfulCompilationAsync);
 await RunAsync("failed compilation diagnostics", FailedCompilationAsync);
 await RunAsync("timeout process cleanup", TimeoutCleanupAsync);
+await RunAsync("cancellation diagnostics", CancellationDiagnosticsAsync);
 await RunAsync("configuration validation", ConfigurationValidationAsync);
 await RunOptionalRealWslGateAsync();
 await RunOptionalRealWslNvidiaGateAsync();
+await RunOptionalRealScaleCoverageAsync();
 await RunOptionalRealWslTimeoutAsync();
 await RunOptionalRealWslResistantTimeoutAsync();
 Console.WriteLine($"Passed {passed} test groups.");
@@ -79,8 +81,8 @@ Task CommandConstructionAsync()
     AssertSequence(
         invocation.Arguments,
         "--distribution", "Ubuntu-24.04", "--cd", "/mnt/d/Temp Folder", "--exec", "/usr/bin/setsid", "--wait",
-        "/bin/sh", "-c", "printf '__SCALE_TOOLCHAIN_PID__:%s\\n' \"$$\"; exec /usr/bin/env \"$@\"", "scale-toolchain",
-        "ALPHA=one", "ZED=two words", "/opt/scale/llvm/bin/nvcc", "--require-scale",
+        "/bin/sh", "-c", "printf '__SCALE_TOOLCHAIN_PID__:%s\\n' \"$$\"; exec /usr/bin/env -i \"$@\"", "scale-toolchain",
+        "ALPHA=one", "PATH=/usr/local/bin:/usr/bin:/bin", "ZED=two words", "/opt/scale/llvm/bin/nvcc", "--require-scale",
         "--gpu-architecture=gfx1201", "-c", "/mnt/d/Temp Folder/input.cu", "-o", "/mnt/d/Temp Folder/output.o");
     AssertEqual("/mnt/d/Temp Folder/input.cu", ScaleCommandBuilder.WindowsToWslPath(@"D:\Temp Folder\input.cu"));
     AssertEqual(ScaleCommandBuilder.WslPidMarker, invocation.WslPidMarker);
@@ -380,6 +382,206 @@ async Task RunOptionalRealWslNvidiaGateAsync()
     Assert(!string.IsNullOrWhiteSpace(result.OutputSha256), "The real NVIDIA SCALE gate must return an output hash.");
     passed++;
     Console.WriteLine("PASS real NVIDIA SCALE gate sm_86");
+}
+
+async Task CancellationDiagnosticsAsync()
+{
+    var outputPath = NewOutputPath("cancel.o");
+    using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
+    var exception = await AssertThrowsAsync<OperationCanceledException>(() => ScaleCompiler.CompileAsync(
+        new ScaleCompilationRequest
+        {
+            SourcePath = sourcePath,
+            OutputPath = outputPath,
+            Settings = new ScaleCompilationSettings
+            {
+                CompilerPath = fakeCompilerPath,
+                Target = ScaleGpuTarget.Amd("gfx1201"),
+                Environment = new Dictionary<string, string>
+                {
+                    ["FAKE_SCALE_MODE"] = "sleep"
+                }
+            }
+        },
+        cancellation.Token));
+    Assert(exception.Data.Contains(ScaleCompilationException.CancellationStandardOutputDataKey), "Cancellation must preserve standard output diagnostics.");
+    Assert(exception.Data.Contains(ScaleCompilationException.CancellationStandardErrorDataKey), "Cancellation must preserve standard error diagnostics.");
+    Assert(!File.Exists(outputPath), "A cancelled compile must remove output.");
+}
+
+async Task RunOptionalRealScaleCoverageAsync()
+{
+    var distribution = Environment.GetEnvironmentVariable("SCALE_REAL_WSL_DISTRIBUTION");
+    var compiler = Environment.GetEnvironmentVariable("SCALE_REAL_WSL_COMPILER");
+    if (!OperatingSystem.IsWindows() || string.IsNullOrWhiteSpace(distribution) || string.IsNullOrWhiteSpace(compiler))
+    {
+        Console.WriteLine("SKIP real SCALE coverage matrix");
+        return;
+    }
+
+    var coverageRoot = Path.Combine(testRoot, "scale-coverage");
+    Directory.CreateDirectory(coverageRoot);
+    var headerPath = Path.Combine(coverageRoot, "coverage-header.cuh");
+    var sourceOnePath = Path.Combine(coverageRoot, "coverage-one.cu");
+    var sourceTwoPath = Path.Combine(coverageRoot, "coverage-two.cu");
+    var hostSourcePath = Path.Combine(coverageRoot, "host-main.cu");
+    await File.WriteAllTextAsync(
+        headerPath,
+        "#define SCALE_COVERAGE_VALUE 7\n" +
+        "__device__ inline int coverage_value(int value) { return value + SCALE_COVERAGE_VALUE; }\n",
+        Encoding.UTF8);
+    await File.WriteAllTextAsync(
+        sourceOnePath,
+        "#include \"coverage-header.cuh\"\n" +
+        "extern \"C\" __global__ void coverage_one(const int* input, int* output) { output[0] = coverage_value(input[0]); }\n",
+        Encoding.UTF8);
+    await File.WriteAllTextAsync(
+        sourceTwoPath,
+        "#include \"coverage-header.cuh\"\n" +
+        "extern \"C\" __global__ void coverage_two(const int* input, int* output) { output[0] = coverage_value(input[0] + 1); }\n",
+        Encoding.UTF8);
+    await File.WriteAllTextAsync(hostSourcePath, "int main() { return 0; }\n", Encoding.UTF8);
+
+    var records = new List<string>();
+    var amdTarget = ScaleGpuTarget.Amd("gfx1201");
+    var plainEnvironment = new Dictionary<string, string>(StringComparer.Ordinal)
+    {
+        ["PATH"] = "/opt/scale/bin:/opt/scale/llvm/bin:/usr/local/bin:/usr/bin:/bin"
+    };
+    var nvidiaEnvironment = new Dictionary<string, string>(StringComparer.Ordinal)
+    {
+        ["PATH"] = "/opt/scale/bin:/opt/scale/llvm/bin:/usr/local/cuda-12.9/bin:/usr/local/bin:/usr/bin:/bin",
+        ["CUDA_PATH"] = "/usr/local/cuda-12.9",
+        ["CUDA_HOME"] = "/usr/local/cuda-12.9",
+        ["CUDA_DIR"] = "/usr/local/cuda-12.9",
+        ["CUDA_ROOT"] = "/usr/local/cuda-12.9",
+        ["CUDA_INC_DIR"] = "/usr/local/cuda-12.9/include",
+        ["CUDA_BIN_PATH"] = "/opt/scale/llvm/bin",
+        ["CUDAARCHS"] = "86",
+        ["CPATH"] = "/usr/local/cuda-12.9/include",
+        ["LIBRARY_PATH"] = "/usr/local/cuda-12.9/lib64",
+        ["LD_LIBRARY_PATH"] = "/usr/local/cuda-12.9/lib64"
+    };
+
+    async Task RunModeAsync(
+        string name,
+        IReadOnlyList<string> arguments,
+        IReadOnlyList<int> pathIndexes,
+        IReadOnlyList<string> outputs,
+        ScaleGpuTarget? target = null,
+        IReadOnlyDictionary<string, string>? environment = null,
+        ScaleTargetArgumentMode targetMode = ScaleTargetArgumentMode.GpuArchitecture)
+    {
+        var actualTarget = target ?? amdTarget;
+        var result = await ScaleCompiler.InvokeAsync(new ScaleInvocationRequest
+        {
+            ToolPath = compiler,
+            Arguments = arguments,
+            Target = actualTarget,
+            TargetArgumentMode = targetMode,
+            PathArgumentIndexes = pathIndexes,
+            OutputPaths = outputs,
+            ExecutionMode = ScaleExecutionMode.Wsl,
+            WslDistribution = distribution,
+            Environment = environment ?? plainEnvironment,
+            Timeout = TimeSpan.FromMinutes(2),
+            WorkingDirectory = coverageRoot
+        });
+        Assert(result.Succeeded, $"The real SCALE mode '{name}' failed: {result.StandardError}");
+        foreach (var output in outputs)
+        {
+            Assert(File.Exists(output), $"The real SCALE mode '{name}' did not create '{output}'.");
+        }
+
+        var hashes = string.Join(',', result.OutputSha256.OrderBy(static pair => pair.Key, StringComparer.Ordinal).Select(static pair => $"{pair.Key}={pair.Value}"));
+        records.Add($"{name}|tool={result.ExecutedToolPath}|target={result.Target}|exit={result.ExitCode}|outputs={string.Join(',', result.ProducedOutputPaths)}|hashes={hashes}");
+    }
+
+    string Output(string name) => Path.Combine(coverageRoot, name);
+
+    var compileObject = Output("coverage-one.o");
+    await RunModeAsync("compile", new[] { "-c", sourceOnePath, "-o", compileObject }, new List<int> { 1, 3 }, new[] { compileObject });
+
+    var preprocessFile = Output("coverage.i");
+    await RunModeAsync("preprocess-file", new[] { "-E", "-o", preprocessFile, sourceOnePath }, new List<int> { 2, 3 }, new[] { preprocessFile });
+    var preprocessStdout = await ScaleCompiler.InvokeAsync(new ScaleInvocationRequest
+    {
+        ToolPath = compiler,
+        Arguments = new[] { "-E", sourceOnePath },
+        Target = amdTarget,
+        PathArgumentIndexes = new List<int> { 1 },
+        ExecutionMode = ScaleExecutionMode.Wsl,
+        WslDistribution = distribution,
+        Environment = plainEnvironment,
+        Timeout = TimeSpan.FromMinutes(2),
+        WorkingDirectory = coverageRoot
+    });
+    Assert(preprocessStdout.Succeeded && preprocessStdout.StandardOutput.Contains("coverage_one", StringComparison.Ordinal), "The real SCALE stdout preprocessor mode must return preprocessed CUDA.");
+    records.Add($"preprocess-stdout|tool={preprocessStdout.ExecutedToolPath}|target={preprocessStdout.Target}|exit={preprocessStdout.ExitCode}|stdout-length={preprocessStdout.StandardOutput.Length}");
+
+    await RunModeAsync("syntax-only", new[] { "-fsyntax-only", sourceOnePath }, new List<int> { 1 }, Array.Empty<string>());
+    var deviceObject = Output("coverage-device.o");
+    await RunModeAsync("device-compile", new[] { "--cuda-device-only", "-c", sourceOnePath, "-o", deviceObject }, new List<int> { 2, 4 }, new[] { deviceObject });
+    var deviceAssembly = Output("coverage-device.s");
+    await RunModeAsync("device-assemble", new[] { "--cuda-device-only", "-S", sourceOnePath, "-o", deviceAssembly }, new List<int> { 2, 4 }, new[] { deviceAssembly });
+    var deviceIr = Output("coverage-device.ll");
+    await RunModeAsync("device-llvm-ir", new[] { "--cuda-device-only", "-S", "-emit-llvm", sourceOnePath, "-o", deviceIr }, new List<int> { 3, 5 }, new[] { deviceIr });
+    var deviceBitcode = Output("coverage-device.bc");
+    await RunModeAsync("device-llvm-bitcode", new[] { "--cuda-device-only", "-c", "-emit-llvm", sourceOnePath, "-o", deviceBitcode }, new List<int> { 3, 5 }, new[] { deviceBitcode });
+    var hostObject = Output("coverage-host.o");
+    await RunModeAsync("host-compile", new[] { "--cuda-host-only", "-c", sourceOnePath, "-o", hostObject }, new List<int> { 2, 4 }, new[] { hostObject });
+    var hostAssembly = Output("coverage-host.s");
+    await RunModeAsync("host-assemble", new[] { "--cuda-host-only", "-S", sourceOnePath, "-o", hostAssembly }, new List<int> { 2, 4 }, new[] { hostAssembly });
+    var precompiled = Output("coverage.precompiled");
+    await RunModeAsync("precompile", new[] { "--precompile", "-o", precompiled, sourceOnePath }, new List<int> { 2, 3 }, new[] { precompiled });
+    var dependencyFile = Output("coverage.d");
+    await RunModeAsync("dependencies", new[] { "-M", "-MF", dependencyFile, sourceOnePath }, new List<int> { 2, 3 }, new[] { dependencyFile });
+    var dependencyObject = Output("coverage-md.o");
+    var dependencyFileWithCompile = Output("coverage-md.d");
+    await RunModeAsync("dependencies-with-compile", new[] { "-MD", "-MF", dependencyFileWithCompile, "-c", sourceOnePath, "-o", dependencyObject }, new List<int> { 2, 4, 6 }, new[] { dependencyObject, dependencyFileWithCompile });
+    var staticLibrary = Output("libcoverage.a");
+    await RunModeAsync("static-library", new[] { "--emit-static-lib", sourceOnePath, sourceTwoPath, "-o", staticLibrary }, new List<int> { 1, 2, 4 }, new[] { staticLibrary });
+    var deviceLink = Output("coverage-dlink.o");
+    await RunModeAsync("device-link", new[] { "-dlink", compileObject, "-o", deviceLink }, new List<int> { 1, 3 }, new[] { deviceLink });
+    var hostShared = Output("coverage-host.so");
+    await RunModeAsync("host-link-shared", new[] { "--cuda-host-only", "-shared", hostSourcePath, "-o", hostShared }, new List<int> { 2, 4 }, new[] { hostShared });
+    var offloadObject = Output("coverage-offload.o");
+    await RunModeAsync("offload-target", new[] { "--offload-arch=gfx1201", "-c", sourceOnePath, "-o", offloadObject }, new List<int> { 2, 4 }, new[] { offloadObject }, targetMode: ScaleTargetArgumentMode.CallerSupplied);
+    var nvidiaObject = Output("coverage-sm_86.o");
+    await RunModeAsync("nvidia-object", new[] { "--cuda-path=/usr/local/cuda-12.9", "-c", sourceOnePath, "-o", nvidiaObject }, new List<int> { 2, 4 }, new[] { nvidiaObject }, ScaleGpuTarget.Nvidia("sm_86"), nvidiaEnvironment);
+
+    var scaleInfo = await ScaleCompiler.InvokeAsync(new ScaleInvocationRequest
+    {
+        ToolPath = "/opt/scale/bin/scaleinfo",
+        Arguments = Array.Empty<string>(),
+        ToolKind = ScaleInvocationToolKind.Utility,
+        TargetArgumentMode = ScaleTargetArgumentMode.None,
+        ExecutionMode = ScaleExecutionMode.Wsl,
+        WslDistribution = distribution,
+        Environment = plainEnvironment,
+        Timeout = TimeSpan.FromSeconds(30),
+        WorkingDirectory = coverageRoot
+    });
+    Assert(scaleInfo.Succeeded && scaleInfo.StandardOutput.Contains("Found", StringComparison.Ordinal), "The scaleinfo utility must report its device scan.");
+    records.Add($"scaleinfo|tool={scaleInfo.ExecutedToolPath}|exit={scaleInfo.ExitCode}|stdout={scaleInfo.StandardOutput.Trim()}");
+    var scaleDiag = await ScaleCompiler.InvokeAsync(new ScaleInvocationRequest
+    {
+        ToolPath = "/opt/scale/bin/scalediag",
+        Arguments = new List<string> { "--help" },
+        ToolKind = ScaleInvocationToolKind.Utility,
+        TargetArgumentMode = ScaleTargetArgumentMode.None,
+        ExecutionMode = ScaleExecutionMode.Wsl,
+        WslDistribution = distribution,
+        Environment = plainEnvironment,
+        Timeout = TimeSpan.FromSeconds(30),
+        WorkingDirectory = coverageRoot
+    });
+    Assert(scaleDiag.Succeeded && scaleDiag.StandardOutput.Contains("Usage: scalediag", StringComparison.Ordinal), "The scalediag utility must return its help surface.");
+    records.Add($"scalediag-help|tool={scaleDiag.ExecutedToolPath}|exit={scaleDiag.ExitCode}|stdout-length={scaleDiag.StandardOutput.Length}");
+
+    await File.WriteAllLinesAsync(Path.Combine(coverageRoot, "coverage-matrix.txt"), records, Encoding.UTF8);
+    passed++;
+    Console.WriteLine("PASS real SCALE coverage matrix");
 }
 
 async Task RunOptionalRealWslTimeoutAsync()

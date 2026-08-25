@@ -27,6 +27,13 @@ internal static class ScaleCommandBuilder
         var environment = request.Environment
             .OrderBy(static pair => pair.Key, StringComparer.Ordinal)
             .ToDictionary(static pair => pair.Key, static pair => pair.Value, StringComparer.Ordinal);
+        if (request.ExecutionMode == ScaleExecutionMode.Wsl && !environment.ContainsKey("PATH"))
+        {
+            environment["PATH"] = "/usr/local/bin:/usr/bin:/bin";
+            environment = environment
+                .OrderBy(static pair => pair.Key, StringComparer.Ordinal)
+                .ToDictionary(static pair => pair.Key, static pair => pair.Value, StringComparer.Ordinal);
+        }
 
         if (request.ExecutionMode == ScaleExecutionMode.Native)
         {
@@ -57,7 +64,7 @@ internal static class ScaleCommandBuilder
             "--wait",
             "/bin/sh",
             "-c",
-            $"printf '{WslPidMarker}%s\\n' \"$$\"; exec /usr/bin/env \"$@\"",
+            $"printf '{WslPidMarker}%s\\n' \"$$\"; exec /usr/bin/env -i \"$@\"",
             "scale-toolchain"
         };
 

@@ -4,6 +4,10 @@ public class ScaleCompilationException : Exception
 {
     public const string CleanupFailureDataKey = "Supprocom.ScaleToolChain.CleanupFailure";
 
+    public const string CancellationStandardOutputDataKey = "Supprocom.ScaleToolChain.CancellationStandardOutput";
+
+    public const string CancellationStandardErrorDataKey = "Supprocom.ScaleToolChain.CancellationStandardError";
+
     public ScaleCompilationException(
         string message,
         string? sourcePath = null,
