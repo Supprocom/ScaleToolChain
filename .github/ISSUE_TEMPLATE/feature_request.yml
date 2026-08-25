@@ -1,0 +1,35 @@
+name: Feature request
+description: Suggest a change for Supprocom.ScaleToolChain.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for a change request.
+        Check existing issues before you submit.
+  - type: textarea
+    id: need
+    attributes:
+      label: Need
+      description: Describe the problem or task that this change should address.
+      placeholder: Explain the user need.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Describe the change that you want.
+      placeholder: Explain the proposed behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Describe other solutions that you considered.
+      placeholder: Explain why other solutions do not meet the need.
+    validations:
+      required: false
